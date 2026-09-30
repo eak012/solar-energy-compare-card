@@ -1,10 +1,11 @@
-/* solar-energy-compare-card.js v8
+/* solar-energy-compare-card.js v9
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
  * v6: legend shows today's values; adds solar/usage ratio bar.
  * v7: replaces ratio bar with daily diff + self-sufficiency stat boxes.
  * v8: hardcodes stat-box labels; drops diff_label/self_label config.
+ * v9: caps days at 15.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -794,7 +795,7 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
       <div class="wrap">
         <div class="section">Entities</div>
         <ha-entity-picker id="solar_entity" label="Solar entity (ผลิตไฟ)"></ha-entity-picker>
-        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-entity-picker>
+        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-textfield>
         <div class="hint">รองรับ sensor ที่เป็น cumulative kWh (มิเตอร์สะสม) เป็นค่าเริ่มต้น</div>
 
         <div class="section">Display</div>
@@ -808,7 +809,7 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
           <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield id="days" label="Days (3-15)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
+          <ha-textfield id="days" label="Days (3-15)" type="number" min="3" max="15" inputmode="numeric"></ha-textfield>
           <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
         </div>
 
