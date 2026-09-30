@@ -1,9 +1,10 @@
-/* solar-energy-compare-card.js v14
+/* solar-energy-compare-card.js v15
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v12: Adds Net/Diff tooltip, custom colors, average line, self-sufficiency badge, and bar entrance animation.
  * v13: solar_color/usage_color are YAML-only; removed from the visual editor.
  * v14: restores solar_color/usage_color fields in the visual editor.
+ * v15: color fields use a native color picker + hex text field.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -741,6 +742,12 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
         ha-textfield, ha-entity-picker, ha-select { width:100%; display:block; }
         .hint { font-size:12px; color:var(--secondary-text-color, #888); margin-top:-8px; }
         .section { font-weight:600; font-size:13px; margin-top:4px; color:var(--primary-text-color); }
+        .color-field > label { display:block; font-size:12px; color:var(--secondary-text-color, #888); margin-bottom:4px; }
+        .color-row { display:flex; gap:8px; align-items:center; }
+        .color-row input[type="color"] { width:42px; height:42px; padding:3px; box-sizing:border-box;
+          border:1px solid var(--divider-color, rgba(127,127,127,.4)); border-radius:10px;
+          background:transparent; cursor:pointer; flex-shrink:0; }
+        .color-row ha-textfield { flex:1; min-width:0; }
       </style>
       <div class="wrap">
         <div class="section">Entities</div>
@@ -754,8 +761,20 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
           <ha-textfield id="usage_label" label="Usage label"></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield id="solar_color" label="Solar color (HEX/RGB)"></ha-textfield>
-          <ha-textfield id="usage_color" label="Usage color (HEX/RGB)"></ha-textfield>
+          <div class="color-field">
+            <label>Solar color</label>
+            <div class="color-row">
+              <input type="color" id="solar_color_picker" value="#ffbd32" title="เลือกสีผลิตไฟ">
+              <ha-textfield id="solar_color" placeholder="#ffbd32"></ha-textfield>
+            </div>
+          </div>
+          <div class="color-field">
+            <label>Usage color</label>
+            <div class="color-row">
+              <input type="color" id="usage_color_picker" value="#2389ff" title="เลือกสีใช้ไฟ">
+              <ha-textfield id="usage_color" placeholder="#2389ff"></ha-textfield>
+            </div>
+          </div>
         </div>
         <div class="row2">
           <ha-textfield id="chart_label" label="Chart tab (กราฟ)"></ha-textfield>
@@ -799,8 +818,6 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     setField("title", c.title || "");
     setField("solar_label", c.solar_label || "");
     setField("usage_label", c.usage_label || "");
-    setField("solar_color", c.solar_color || "#ffbd32");
-    setField("usage_color", c.usage_color || "#2389ff");
     setField("chart_label", c.chart_label || "");
     setField("list_label", c.list_label || "");
     setField("days", c.days ?? 15);
@@ -825,12 +842,35 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     onField("title", "title", false);
     onField("solar_label", "solar_label", false);
     onField("usage_label", "usage_label", false);
-    onField("solar_color", "solar_color", false);
-    onField("usage_color", "usage_color", false);
     onField("chart_label", "chart_label", false);
     onField("list_label", "list_label", false);
     onField("days", "days", true);
     onField("decimals", "decimals", true);
+
+    // Color pickers: native color input synced both ways with the hex text field.
+    // The picker only understands #rrggbb; anything else stays text-only.
+    const isHexColor = (v) => /^#[0-9a-fA-F]{6}$/.test(String(v || "").trim());
+    const wireColor = (textId, pickerId, key, fallback) => {
+      const text = $(textId);
+      const picker = $(pickerId);
+      if (!text || !picker) return;
+      const current = c[key] || fallback;
+      text.value = current;
+      picker.value = isHexColor(current) ? current.trim().toLowerCase() : fallback;
+      picker.addEventListener("input", (e) => {
+        text.value = e.target.value;
+        this._update(key, e.target.value);
+      });
+      const onText = (e) => {
+        const v = e.target.value;
+        this._update(key, v);
+        if (isHexColor(v)) picker.value = v.trim().toLowerCase();
+      };
+      text.addEventListener("input", onText);
+      text.addEventListener("change", onText);
+    };
+    wireColor("solar_color", "solar_color_picker", "solar_color", "#ffbd32");
+    wireColor("usage_color", "usage_color_picker", "usage_color", "#2389ff");
 
     const agg = $("aggregation");
     if (agg) {
