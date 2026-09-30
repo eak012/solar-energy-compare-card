@@ -467,8 +467,9 @@ class SolarEnergyCompareCard extends HTMLElement {
     const todaySolar = today ? today.solar : 0;
     const todayUsage = today ? today.usage : 0;
 
-    const diff = todaySolar - todayUsage;
-    const diffText = (diff >= 0 ? "+" : "−") + this._fmt(Math.abs(diff)) + " kWh";
+    const diff = Math.round((todaySolar - todayUsage) * 10) / 10;
+    const diffCls = diff > 0 ? "pos" : diff < 0 ? "neg" : "zero";
+    const diffText = (diff > 0 ? "+" : diff < 0 ? "−" : "") + this._fmt(Math.abs(diff)) + " kWh";
     const selfPct = todayUsage > 0
       ? (Math.min(todaySolar, todayUsage) / todayUsage) * 100
       : 0;
@@ -481,7 +482,7 @@ class SolarEnergyCompareCard extends HTMLElement {
       <div class="stats">
         <div class="stat">
           <div class="stat-label">${this._esc(this._config.diff_label)}</div>
-          <div class="stat-value ${diff >= 0 ? "pos" : "neg"}">${diffText}</div>
+          <div class="stat-value ${diffCls}">${diffText}</div>
         </div>
         <div class="stat">
           <div class="stat-label">${this._esc(this._config.self_label)}</div>
@@ -672,6 +673,7 @@ class SolarEnergyCompareCard extends HTMLElement {
         font-variant-numeric:tabular-nums; }
       .stat-value.pos { color:var(--success-color, #43a047); }
       .stat-value.neg { color:var(--error-color, #db4437); }
+      .stat-value.zero { color:var(--secondary-text-color, #727272); }
       .stat-value.self { color:var(--primary-color, #1f7ae0); }
 
       /* Chart: bars+gridlines are SVG, axis labels are plain HTML so the
