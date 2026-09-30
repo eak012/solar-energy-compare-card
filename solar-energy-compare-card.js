@@ -8,59 +8,37 @@ class SolarEnergyCompareCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
-    this._config = null;
+    this._config = {};
     this._hass = null;
     this._data = [];
-    this._loading = true;
+    this._loading = false;
     this._error = null;
     this._selected = null;
-    this._lastStateKey = null;
-    this._loadedOnce = false;
-    this._configMissing = false;
+    this._view = "chart"; // 'chart' | 'list'
     this._configTimer = null;
     this._refreshTimer = null;
     this._lastFetch = 0;
-    this._view = "chart";
-  }
-
-  static getConfigElement() {
-    return document.createElement("solar-energy-compare-card-editor");
-  }
-
-  static getStubConfig() {
-    return {
-      solar_entity: "",
-      usage_entity: "",
-      title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
-      solar_label: "ผลิตไฟ",
-      usage_label: "ใช้ไฟ",
-      chart_label: "กราฟ",
-      list_label: "รายการ",
-      days: 15,
-      decimals: 1,
-      aggregation: "delta",
-    };
   }
 
   setConfig(config) {
-    const prevEntities = this._config
-      ? `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`
-      : null;
-    const wasMissing = this._configMissing;
     this._config = {
+      days: 15,
       title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
       solar_label: "ผลิตไฟ",
       usage_label: "ใช้ไฟ",
       chart_label: "กราฟ",
       list_label: "รายการ",
-      days: 15,
+      unit: "kWh",
       decimals: 1,
+      history_hours: 24 * 17,
       aggregation: "delta",
       ...config,
     };
-    // Don't throw while the user is still picking entities in the visual
-    // editor — show a friendly placeholder instead.
-    this._configMissing = !(this._config.solar_entity && this._config.usage_entity);
+    // Don't throw for missing entities — show a friendly placeholder instead.
+    // This keeps getStubConfig("") working and the visual editor usable.
+    const wasMissing = this._configMissing;
+    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
+    this._configMissing = !config?.solar_entity || !config?.usage_entity;
     const newEntities = `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`;
     // Fetch history when entities become valid or change
     if (!this._configMissing && this._hass) {
@@ -79,9 +57,7 @@ class SolarEnergyCompareCard extends HTMLElement {
     if (!this._loadedOnce) {
       this._loadedOnce = true;
       this._loadHistory();
-      return;
-    }
-    if (this._config) {
+    } else {
       const s = hass.states?.[this._config.solar_entity];
       const u = hass.states?.[this._config.usage_entity];
       const key = `${s?.state}|${u?.state}`;
@@ -99,8 +75,26 @@ class SolarEnergyCompareCard extends HTMLElement {
     }
   }
 
-  getCardSize() {
-    return this._view === "list" ? 6 : 5;
+  getCardSize() { return 4; }
+
+  static getConfigElement() {
+    return document.createElement("solar-energy-compare-card-editor");
+  }
+
+  static getStubConfig() {
+    return {
+      type: "custom:solar-energy-compare-card",
+      solar_entity: "",
+      usage_entity: "",
+      days: 15,
+      title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
+      solar_label: "ผลิตไฟ",
+      usage_label: "ใช้ไฟ",
+      chart_label: "กราฟ",
+      list_label: "รายการ",
+      decimals: 1,
+      aggregation: "delta",
+    };
   }
 
   async _loadHistory() {
@@ -113,208 +107,278 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._lastFetch = Date.now();
     if (firstLoad) this._render();
     try {
-      const days = Number(this._config.days) || 15;
-      // Buffer days so "last reading of previous day" deltas work.
-      const hours = (days + 3) * 24;
-      const [solarHist, usageHist] = await Promise.all([
-        this._fetchHistory(this._config.solar_entity, hours),
-        this._fetchHistory(this._config.usage_entity, hours),
+      const days = Math.max(3, Math.min(31, Number(this._config.days) || 15));
+      const now = new Date();
+      // +3 days buffer: delta needs the previous day's last reading
+      const start = new Date(now.getTime() - (days + 3) * 24 * 3600 * 1000);
+
+      const [solarHistory, usageHistory] = await Promise.all([
+        this._fetchHistory(this._config.solar_entity, start),
+        this._fetchHistory(this._config.usage_entity, start),
       ]);
-      let data = this._buildDaily(
-        solarHist, usageHist, days, this._config.aggregation
-      );
-      if (!data.length) {
-        // Fallback: long-term statistics (survives recorder purge).
-        const [solarStats, usageStats] = await Promise.all([
-          this._fetchStatistics(this._config.solar_entity, days),
-          this._fetchStatistics(this._config.usage_entity, days),
-        ]);
-        data = this._buildDailyFromStats(solarStats, usageStats, days);
+
+      // Fallback: long-term statistics. Recorder keeps only ~10 days of raw
+      // history by default (and some entities are excluded from recorder),
+      // but energy sensors almost always have long-term statistics.
+      let solarStat = null;
+      let usageStat = null;
+      if (!solarHistory.length) {
+        solarStat = await this._fetchDailyStatistics(this._config.solar_entity, days).catch(() => null);
       }
-      console.info(
-        `[solar-energy-compare-card] history points: solar=${solarHist.length}, usage=${usageHist.length} | daily rows=${data.length}`
-      );
-      if (!data.length) {
-        console.warn(
-          "[solar-energy-compare-card] No data from recorder history or long-term statistics. " +
-          "Check that the entities are recorded (recorder include/exclude) and have statistics."
-        );
+      if (!usageHistory.length) {
+        usageStat = await this._fetchDailyStatistics(this._config.usage_entity, days).catch(() => null);
       }
-      this._data = data;
-      if (data.length) {
-        if (!this._selected || !data.some(d => d.date === this._selected)) {
-          this._selected = data[data.length - 1].date;
+
+      console.debug("[solar-energy-compare-card] history points:",
+        this._config.solar_entity, solarHistory.length,
+        this._config.usage_entity, usageHistory.length,
+        "| stat days:", solarStat?.size ?? "-", usageStat?.size ?? "-");
+
+      const all = this._buildDailyData(solarHistory, usageHistory, solarStat, usageStat);
+      this._data = all.slice(-days);
+
+      if (!this._data.length) {
+        console.warn("[solar-energy-compare-card] no daily data. Check that the entity_ids exist and are recorded (recorder) or have long-term statistics:",
+          this._config.solar_entity, this._config.usage_entity);
+      }
+      if (this._data.length) {
+        if (!this._selected || !this._data.some(d => d.date === this._selected)) {
+          this._selected = this._data[this._data.length - 1].date;
         }
       }
-    } catch (err) {
-      console.error("[solar-energy-compare-card] load failed:", err);
-      this._error = err?.message || String(err);
+    } catch (e) {
+      console.error("[solar-energy-compare-card]", e);
+      this._error = e?.message || String(e);
     } finally {
       this._loading = false;
       this._render();
     }
   }
 
-  async _fetchHistory(entityId, hours) {
-    const end = new Date();
-    const start = new Date(end.getTime() - hours * 3600 * 1000);
-    const url =
-      `/api/history/period/${start.toISOString()}?` +
-      `filter_entity_id=${encodeURIComponent(entityId)}&end_time=${encodeURIComponent(end.toISOString())}&minimal_response`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${this._getToken()}` },
+  _fetchHistory(entityId, start) {
+    return this._hass.callWS({
+      type: "history/history_during_period",
+      start_time: start.toISOString(),
+      end_time: new Date().toISOString(),
+      entity_ids: [entityId],
+      minimal_response: false,
+      no_attributes: true,
+      significant_changes_only: false,
+    }).then(result => {
+      if (!result) return [];
+      if (Array.isArray(result)) {
+        const found = result.find(r => r && r.entity_id === entityId);
+        return (found && (found.states || found.data)) || [];
+      }
+      return result[entityId] || [];
+    }).catch(err => {
+      console.warn("[solar-energy-compare-card] history failed for", entityId, err?.message || err);
+      return [];
     });
-    if (!res.ok) throw new Error(`history HTTP ${res.status}`);
-    const json = await res.json();
-    // HA returns an array of arrays (one per entity); be defensive.
-    const flat = Array.isArray(json) ? json.flat() : [];
-    return flat
-      .map(r => ({
-        t: this._parseTime(r),
-        v: Number(r.state ?? r.s),
-      }))
-      .filter(p => Number.isFinite(p.t) && Number.isFinite(p.v))
-      .sort((a, b) => a.t - b.t);
   }
 
-  _parseTime(r) {
-    const raw = r.last_changed ?? r.lc ?? r.last_updated ?? r.lu ?? r.t;
-    if (typeof raw === "number") return raw < 1e12 ? raw * 1000 : raw;
-    const t = Date.parse(raw);
-    return Number.isFinite(t) ? t : NaN;
-  }
-
-  async _fetchStatistics(entityId, days) {
+  // Long-term statistics fallback -> Map("YYYY-MM-DD" -> kWh used that day).
+  // Prefers per-day `change` (already a daily delta); otherwise diffs the
+  // cumulative `sum`/`state` of consecutive days.
+  async _fetchDailyStatistics(entityId, days) {
     const end = new Date();
-    end.setHours(23, 59, 59, 999);
-    const start = new Date(end);
-    start.setDate(start.getDate() - (days - 1));
-    start.setHours(0, 0, 0, 0);
-    const msg = {
+    const start = new Date(end.getTime() - (days + 2) * 24 * 3600 * 1000);
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const toMs = (t) => {
+      if (t == null) return NaN;
+      if (typeof t === "number") return t < 1e12 ? t * 1000 : t;
+      return Date.parse(t);
+    };
+    const callStats = (types) => this._hass.callWS({
       type: "recorder/statistics_during_period",
       start_time: start.toISOString(),
       end_time: end.toISOString(),
-      statistic_ids: [entityId],
       period: "day",
-      units: { energy: "kWh" },
-    };
-    const res = await this._hass.callWS(msg);
-    const rows = res?.[entityId] || [];
-    return rows.map(r => {
-      const startTs = Date.parse(r.start);
-      const change = Number(r.change);
-      let value;
-      if (Number.isFinite(change)) value = change;
-      else if (Number.isFinite(Number(r.sum)) && Number.isFinite(Number(r.mean))) value = Number(r.sum);
-      else value = Number(r.state);
-      return { t: startTs, v: value };
-    }).filter(p => Number.isFinite(p.t) && Number.isFinite(p.v));
-  }
+      statistic_ids: [entityId],
+      ...(types ? { statistic_types: types } : {}),
+    });
 
-  _getToken() {
-    // Prefer the hass connection auth; fallback to localStorage (frontend).
+    let result;
     try {
-      const conn = this._hass?.connection;
-      const token = conn?.options?.auth?.data?.access_token;
-      if (token) return token;
-    } catch { /* ignore */ }
-    try {
-      const raw = localStorage.getItem("hassTokens");
-      if (raw) return JSON.parse(raw).access_token || "";
-    } catch { /* ignore */ }
-    return "";
-  }
-
-  _dayKey(ts) {
-    const d = new Date(ts);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  }
-
-  _buildDaily(solarHist, usageHist, days, aggregation) {
-    const groupByDay = (hist) => {
-      const map = new Map();
-      for (const p of hist) {
-        const k = this._dayKey(p.t);
-        if (!map.has(k)) map.set(k, []);
-        map.get(k).push(p);
-      }
-      return map;
-    };
-    const solarByDay = groupByDay(solarHist);
-    const usageByDay = groupByDay(usageHist);
-
-    const lastOf = (arr) => arr[arr.length - 1].v;
-    const firstOf = (arr) => arr[0].v;
-
-    const keys = [];
-    const today = new Date();
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      keys.push(this._dayKey(d.getTime()));
+      result = await callStats(["change", "sum", "state"]);
+    } catch (e) {
+      result = await callStats(null); // older HA without "change" type
     }
-    // Include one extra previous day so sparse sensors (e.g. one reading
-    // per day) still produce a delta for the first visible day.
-    const prevKey = (() => {
-      const d = new Date(today);
-      d.setDate(d.getDate() - days);
-      return this._dayKey(d.getTime());
-    })();
 
-    const deltaFor = (byDay, key, prevK) => {
-      const cur = byDay.get(key);
-      const prev = byDay.get(prevK);
-      if (!cur || !cur.length) return 0;
-      if (prev && prev.length) {
-        const delta = lastOf(cur) - lastOf(prev);
-        return delta >= 0 ? delta : Math.max(0, lastOf(cur)); // counter reset
+    const rows = (result?.[entityId] || [])
+      .map(r => ({
+        ms: toMs(r.start),
+        change: num(r.change),
+        sum: num(r.sum),
+        state: num(r.state),
+      }))
+      .filter(r => Number.isFinite(r.ms))
+      .sort((a, b) => a.ms - b.ms);
+
+    const map = new Map();
+    let prevSum = null;
+    let prevState = null;
+    for (const r of rows) {
+      const key = this._localDateKey(new Date(r.ms));
+      let daily = null;
+      if (r.change != null) {
+        daily = Math.max(0, r.change);
+      } else if (r.sum != null && prevSum != null) {
+        daily = r.sum - prevSum;
+        if (daily < 0) daily = Math.max(0, r.sum); // counter reset
+      } else if (r.state != null && prevState != null) {
+        daily = r.state - prevState;
+        if (daily < 0) daily = Math.max(0, r.state);
       }
-      // Fallback: intra-day delta when there is no previous-day reading.
-      const delta = lastOf(cur) - firstOf(cur);
-      return delta > 0 ? delta : 0;
-    };
-    const dailyValueFor = (byDay, key) => {
-      const cur = byDay.get(key);
-      if (!cur || !cur.length) return 0;
-      return Math.max(0, lastOf(cur));
+      if (daily != null && Number.isFinite(daily)) map.set(key, Math.max(0, daily));
+      if (r.sum != null) prevSum = r.sum;
+      if (r.state != null) prevState = r.state;
+    }
+    return map;
+  }
+
+  _buildDailyData(solarPts, usagePts, solarStat, usageStat) {
+    if (this._config.aggregation === "daily") {
+      return this._buildDailyLastValue(solarPts, usagePts);
+    }
+    return this._buildDeltaDaily(solarPts, usagePts, solarStat, usageStat);
+  }
+
+  // delta mode: daily = last reading of the day − last reading of the
+  // previous day. Works with sparse history (even 1 reading/day).
+  // Entities with no recorder history fall back to long-term statistics.
+  _buildDeltaDaily(solarPts, usagePts, solarStat, usageStat) {
+    const perEntity = (pts) => {
+      const norm = this._normaliseHistory(pts);
+      const lastByDate = new Map();
+      for (const p of norm) lastByDate.set(p.date, p.value);
+      const dates = [...lastByDate.keys()].sort();
+      const out = new Map();
+      let prev = null;
+      for (const d of dates) {
+        const cur = lastByDate.get(d);
+        if (prev != null && cur != null) {
+          let delta = cur - prev;
+          if (delta < 0) {
+            // counter reset across the gap: use within-day positive movement
+            delta = this._withinDayGain(norm, d);
+            if (!(delta > 0)) delta = Math.max(0, cur);
+          }
+          out.set(d, Math.max(0, delta));
+        }
+        if (cur != null) prev = cur;
+      }
+      return out;
     };
 
-    return keys.map((key, idx) => {
-      const prevK = idx === 0 ? prevKey : keys[idx - 1];
-      const solar = aggregation === "daily"
-        ? dailyValueFor(solarByDay, key)
-        : deltaFor(solarByDay, key, prevK);
-      const usage = aggregation === "daily"
-        ? dailyValueFor(usageByDay, key)
-        : deltaFor(usageByDay, key, prevK);
-      return { date: key, solar, usage };
+    const sD = perEntity(solarPts);
+    const uD = perEntity(usagePts);
+
+    const useStatS = sD.size === 0 && solarStat && solarStat.size > 0;
+    const useStatU = uD.size === 0 && usageStat && usageStat.size > 0;
+
+    const dates = new Set([
+      ...sD.keys(),
+      ...uD.keys(),
+      ...(useStatS ? solarStat.keys() : []),
+      ...(useStatU ? usageStat.keys() : []),
+    ]);
+    return [...dates].sort().map(date => ({
+      date,
+      solar: this._safe(useStatS ? (solarStat.get(date) ?? 0) : (sD.get(date) ?? 0)),
+      usage: this._safe(useStatU ? (usageStat.get(date) ?? 0) : (uD.get(date) ?? 0)),
+    }));
+  }
+
+  _buildDailyLastValue(solarPts, usagePts) {
+    const lastByDate = (pts) => {
+      const m = new Map();
+      for (const p of this._normaliseHistory(pts)) m.set(p.date, p.value);
+      return m;
+    };
+    const sM = lastByDate(solarPts);
+    const uM = lastByDate(usagePts);
+    const dates = new Set([...sM.keys(), ...uM.keys()]);
+    return [...dates].sort().map(date => ({
+      date,
+      solar: this._safe(sM.get(date) ?? 0),
+      usage: this._safe(uM.get(date) ?? 0),
+    }));
+  }
+
+  _withinDayGain(norm, date) {
+    let gain = 0;
+    let prev = null;
+    for (const p of norm) {
+      if (p.date !== date) continue;
+      if (prev != null && p.value > prev) gain += p.value - prev;
+      prev = p.value;
+    }
+    return gain;
+  }
+
+  _normaliseHistory(history) {
+    return (history || [])
+      .map(item => {
+        const value = Number.parseFloat(item.state ?? item.s);
+        let ms = Date.parse(item.last_changed || item.last_updated || "");
+        if (!Number.isFinite(ms)) {
+          const lc = item.lc ?? item.lu;
+          const n = Number(lc);
+          if (Number.isFinite(n)) ms = n < 1e12 ? n * 1000 : n;
+        }
+        const dt = new Date(ms);
+        return {
+          value,
+          dt,
+          date: Number.isFinite(ms) ? this._localDateKey(dt) : null,
+        };
+      })
+      .filter(x => Number.isFinite(x.value) && x.date)
+      .sort((a, b) => a.dt - b.dt);
+  }
+
+  _localDateKey(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  _safe(v) { return Number.isFinite(v) ? Math.max(0, v) : 0; }
+
+  _fmt(v) {
+    return Number(v || 0).toLocaleString("th-TH", {
+      minimumFractionDigits: this._config.decimals,
+      maximumFractionDigits: this._config.decimals,
     });
   }
 
-  _buildDailyFromStats(solarStats, usageStats, days) {
-    const toMap = (stats) => {
-      const map = new Map();
-      for (const p of stats) map.set(this._dayKey(p.t), p.v);
-      return map;
-    };
-    const sMap = toMap(solarStats);
-    const uMap = toMap(usageStats);
-    const today = new Date();
-    const out = [];
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      const key = this._dayKey(d.getTime());
-      out.push({
-        date: key,
-        solar: Math.max(0, sMap.get(key) || 0),
-        usage: Math.max(0, uMap.get(key) || 0),
-      });
+  // Compact axis tick: drop the decimals when the value is whole.
+  _fmtTick(v) {
+    if (Math.abs(v - Math.round(v)) < 1e-9) {
+      return Number(Math.round(v)).toLocaleString("th-TH");
     }
-    // Drop leading all-zero days that are just "no data yet".
-    let first = out.findIndex(r => r.solar > 0 || r.usage > 0);
-    if (first === -1) return [];
-    return out.slice(first);
+    return this._fmt(v);
+  }
+
+  _dayLabel(dateKey) {
+    const [y, m, d] = dateKey.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    return {
+      day: String(d),
+      month: dt.toLocaleDateString("th-TH", { month: "short" }).replace(".", ""),
+    };
+  }
+
+  _dateFull(dateKey) {
+    const [y, m, d] = dateKey.split("-").map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString("th-TH", {
+      day: "numeric", month: "short", year: "numeric",
+    });
   }
 
   _setView(view) {
@@ -324,13 +388,15 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   _render() {
-    const style = `<style>${this._css()}</style>`;
     if (!this.shadowRoot) return;
+    const style = `<style>${this._css()}</style>`;
+
     if (this._configMissing) {
-      this.shadowRoot.innerHTML = `${style}<ha-card><div class="empty">กรุณาเลือก entity สำหรับการผลิตไฟและการใช้ไฟ<br><small>เปิด Visual editor แล้วเลือก entity ทั้งสองช่อง</small></div></ha-card>`;
+      this.shadowRoot.innerHTML = `${style}<ha-card><div class="empty" style="padding:28px 16px;">กรุณาเลือก solar_entity และ usage_entity<br><small>เปิด Visual editor เพื่อเลือก entity</small></div></ha-card>`;
       return;
     }
-    if (this._loading && this._data.length === 0) {
+
+    if (this._loading) {
       this.shadowRoot.innerHTML = `${style}<ha-card><div class="loading">กำลังโหลดข้อมูล...</div></ha-card>`;
       return;
     }
@@ -628,38 +694,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       }
     `;
   }
-
-  _fmt(v) {
-    return Number(v || 0).toLocaleString("th-TH", {
-      minimumFractionDigits: this._config.decimals,
-      maximumFractionDigits: this._config.decimals,
-    });
-  }
-
-  // Compact axis tick: drop the decimals when the value is whole.
-  _fmtTick(v) {
-    if (Math.abs(v - Math.round(v)) < 1e-9) {
-      return Number(Math.round(v)).toLocaleString("th-TH");
-    }
-    return this._fmt(v);
-  }
-
-  _dayLabel(dateKey) {
-    const [y, m, d] = dateKey.split("-").map(Number);
-    const dt = new Date(y, m - 1, d);
-    return {
-      day: String(d),
-      month: dt.toLocaleDateString("th-TH", { month: "short" }).replace(".", ""),
-    };
-  }
-
-  _dateFull(dateKey) {
-    const [y, m, d] = dateKey.split("-").map(Number);
-    const dt = new Date(y, m - 1, d);
-    return dt.toLocaleDateString("th-TH", {
-      weekday: "long", day: "numeric", month: "long", year: "numeric",
-    });
-  }
 }
 
 customElements.define("solar-energy-compare-card", SolarEnergyCompareCard);
@@ -687,6 +721,7 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
 
   _update(key, value) {
     const next = { ...this._config, [key]: value };
+    // drop empty optional strings to keep yaml clean, but keep required entities even if empty
     this._config = next;
     this.dispatchEvent(new CustomEvent("config-changed", {
       detail: { config: next },
@@ -703,58 +738,110 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
         .wrap { display:flex; flex-direction:column; gap:12px; padding:4px 2px; }
         .row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
         ha-textfield, ha-entity-picker, ha-select { width:100%; display:block; }
-        .note { font-size:12px; color:var(--secondary-text-color); }
+        .hint { font-size:12px; color:var(--secondary-text-color, #888); margin-top:-8px; }
+        .section { font-weight:600; font-size:13px; margin-top:4px; color:var(--primary-text-color); }
       </style>
       <div class="wrap">
-        <ha-entity-picker
-          label="Solar entity (พลังงานสะสม)"
-          .hass=${this._hass}
-          .value=${c.solar_entity || ""}
-          @value-changed=${e => this._update("solar_entity", e.detail.value)}
-          allow-custom-entity
-        ></ha-entity-picker>
-        <ha-entity-picker
-          label="Usage entity (พลังงานสะสม)"
-          .hass=${this._hass}
-          .value=${c.usage_entity || ""}
-          @value-changed=${e => this._update("usage_entity", e.detail.value)}
-          allow-custom-entity
-        ></ha-entity-picker>
-        <ha-textfield
-          label="Title"
-          .value=${c.title || ""}
-          @input=${e => this._update("title", e.target.value)}
-        ></ha-textfield>
+        <div class="section">Entities</div>
+        <ha-entity-picker id="solar_entity" label="Solar entity (ผลิตไฟ)"></ha-entity-picker>
+        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-entity-picker>
+        <div class="hint">รองรับ sensor ที่เป็น cumulative kWh (มิเตอร์สะสม) เป็นค่าเริ่มต้น</div>
+
+        <div class="section">Display</div>
+        <ha-textfield id="title" label="Title"></ha-textfield>
         <div class="row2">
-          <ha-textfield label="Solar label" .value=${c.solar_label || ""}
-            @input=${e => this._update("solar_label", e.target.value)}></ha-textfield>
-          <ha-textfield label="Usage label" .value=${c.usage_label || ""}
-            @input=${e => this._update("usage_label", e.target.value)}></ha-textfield>
+          <ha-textfield id="solar_label" label="Solar label"></ha-textfield>
+          <ha-textfield id="usage_label" label="Usage label"></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield label="Chart tab label" .value=${c.chart_label || ""}
-            @input=${e => this._update("chart_label", e.target.value)}></ha-textfield>
-          <ha-textfield label="List tab label" .value=${c.list_label || ""}
-            @input=${e => this._update("list_label", e.target.value)}></ha-textfield>
+          <ha-textfield id="chart_label" label="Chart tab (กราฟ)"></ha-textfield>
+          <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield label="Days" type="number" .value=${c.days ?? 15}
-            @input=${e => this._update("days", Number(e.target.value) || 15)}></ha-textfield>
-          <ha-textfield label="Decimals" type="number" .value=${c.decimals ?? 1}
-            @input=${e => this._update("decimals", Number(e.target.value) || 0)}></ha-textfield>
+          <ha-textfield id="days" label="Days (3-31)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
+          <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
         </div>
-        <ha-select label="Aggregation" .value=${c.aggregation || "delta"}
-          @value-changed=${e => this._update("aggregation", e.detail.value)}
-          @closed=${e => e.stopPropagation()}>
-          <mwc-list-item value="delta">delta — คำนวณรายวันจากค่าต่าง (sensor สะสม)</mwc-list-item>
-          <mwc-list-item value="daily">daily — sensor เป็นค่ารายวันอยู่แล้ว</mwc-list-item>
+
+        <div class="section">Data</div>
+        <ha-select id="aggregation" label="Aggregation">
+          <mwc-list-item value="delta">delta — คำนวณรายวันจากมิเตอร์สะสม</mwc-list-item>
+          <mwc-list-item value="daily">daily — entity เป็นค่ารายวันอยู่แล้ว</mwc-list-item>
         </ha-select>
-        <div class="note">entity ควรเป็น sensor พลังงานสะสม (kWh) ที่ถูกบันทึกใน recorder หรือมี long-term statistics</div>
+        <div class="hint">ถ้า sensor รีเซ็ตทุกวันให้เลือก daily, ถ้าเป็นมิเตอร์สะสมให้ใช้ delta</div>
       </div>
     `;
-    this.shadowRoot.querySelectorAll("ha-entity-picker").forEach(p => {
-      if (this._hass) p.hass = this._hass;
-    });
+
+    const $ = (id) => this.shadowRoot.querySelector("#" + id);
+
+    // Set values as properties (not attributes) so HA web components pick them up
+    const solarPicker = $("solar_entity");
+    const usagePicker = $("usage_entity");
+    if (solarPicker) {
+      solarPicker.hass = this._hass;
+      solarPicker.value = c.solar_entity || "";
+      solarPicker.setAttribute("label", "Solar entity (ผลิตไฟ)");
+      try { solarPicker.setAttribute("domain-filter", "sensor"); } catch (e) {}
+      solarPicker.allowCustomEntity = true;
+      solarPicker.addEventListener("value-changed", e => this._update("solar_entity", e.detail.value));
+    }
+    if (usagePicker) {
+      usagePicker.hass = this._hass;
+      usagePicker.value = c.usage_entity || "";
+      try { usagePicker.setAttribute("domain-filter", "sensor"); } catch (e) {}
+      usagePicker.allowCustomEntity = true;
+      usagePicker.addEventListener("value-changed", e => this._update("usage_entity", e.detail.value));
+    }
+
+    const setField = (id, val) => {
+      const el = $(id);
+      if (el) el.value = val ?? "";
+    };
+    setField("title", c.title || "");
+    setField("solar_label", c.solar_label || "");
+    setField("usage_label", c.usage_label || "");
+    setField("chart_label", c.chart_label || "");
+    setField("list_label", c.list_label || "");
+    setField("days", c.days ?? 15);
+    setField("decimals", c.decimals ?? 1);
+
+    const onField = (id, key, isNumber) => {
+      const el = $(id);
+      if (!el) return;
+      const handler = (e) => {
+        let v = e.target.value;
+        if (isNumber) {
+          if (v === "" || v === null) { this._update(key, ""); return; }
+          const n = Number(v);
+          this._update(key, Number.isFinite(n) ? n : v);
+          return;
+        }
+        this._update(key, v);
+      };
+      el.addEventListener("input", handler);
+      el.addEventListener("change", handler);
+    };
+    onField("title", "title", false);
+    onField("solar_label", "solar_label", false);
+    onField("usage_label", "usage_label", false);
+    onField("chart_label", "chart_label", false);
+    onField("list_label", "list_label", false);
+    onField("days", "days", true);
+    onField("decimals", "decimals", true);
+
+    const agg = $("aggregation");
+    if (agg) {
+      agg.value = c.aggregation || "delta";
+      agg.addEventListener("value-changed", e => this._update("aggregation", e.detail.value));
+      agg.addEventListener("change", e => {
+        if (e.target.value) this._update("aggregation", e.target.value);
+      });
+      // fallback for older ha-select
+      agg.addEventListener("closed", () => {
+        if (agg.value && agg.value !== (this._config.aggregation || "delta")) {
+          this._update("aggregation", agg.value);
+        }
+      });
+    }
   }
 }
 
@@ -764,6 +851,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Compare daily solar production vs household energy use.",
+  description: "Solar vs home usage chart with กราฟ/รายการ tabs, hover/touch tooltip.",
   preview: true,
 });
