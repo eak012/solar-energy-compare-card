@@ -112,7 +112,7 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._lastFetch = Date.now();
     if (firstLoad) this._render();
     try {
-      const days = Math.max(3, Math.min(31, Number(this._config.days) || 15));
+      const days = Math.max(3, Math.min(15, Number(this._config.days) || 15));
       const now = new Date();
       // +3 days buffer: delta needs the previous day's last reading
       const start = new Date(now.getTime() - (days + 3) * 24 * 3600 * 1000);
@@ -808,7 +808,7 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
           <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield id="days" label="Days (3-31)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
+          <ha-textfield id="days" label="Days (3-15)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
           <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
         </div>
 
