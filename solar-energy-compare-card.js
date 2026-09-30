@@ -57,6 +57,26 @@ class SolarEnergyCompareCard extends HTMLElement {
 
   getCardSize() { return 4; }
 
+  static getConfigElement() {
+    return document.createElement("solar-energy-compare-card-editor");
+  }
+
+  static getStubConfig() {
+    return {
+      type: "custom:solar-energy-compare-card",
+      solar_entity: "",
+      usage_entity: "",
+      days: 15,
+      title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
+      solar_label: "ผลิตไฟ",
+      usage_label: "ใช้ไฟ",
+      chart_label: "กราฟ",
+      list_label: "รายการ",
+      decimals: 1,
+      aggregation: "delta",
+    };
+  }
+
   async _loadHistory() {
     if (!this._hass || this._loading) return;
     this._loading = true;
@@ -485,6 +505,155 @@ class SolarEnergyCompareCard extends HTMLElement {
 }
 
 customElements.define("solar-energy-compare-card", SolarEnergyCompareCard);
+
+/* ---------- Visual Editor ---------- */
+class SolarEnergyCompareCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._config = {};
+    this._hass = null;
+  }
+
+  setConfig(config) {
+    this._config = { ...config };
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    // re-render once hass is available so entity pickers get hass
+    if (this.shadowRoot && this.shadowRoot.innerHTML === "") this._render();
+    this.shadowRoot?.querySelectorAll("ha-entity-picker").forEach(p => { p.hass = hass; });
+  }
+
+  _update(key, value) {
+    const next = { ...this._config, [key]: value };
+    // drop empty optional strings to keep yaml clean, but keep required entities even if empty
+    this._config = next;
+    this.dispatchEvent(new CustomEvent("config-changed", {
+      detail: { config: next },
+      bubbles: true,
+      composed: true,
+    }));
+  }
+
+  _render() {
+    if (!this.shadowRoot) return;
+    const c = this._config || {};
+    this.shadowRoot.innerHTML = `
+      <style>
+        .wrap { display:flex; flex-direction:column; gap:12px; padding:4px 2px; }
+        .row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        ha-textfield, ha-entity-picker, ha-select { width:100%; display:block; }
+        .hint { font-size:12px; color:var(--secondary-text-color, #888); margin-top:-8px; }
+        .section { font-weight:600; font-size:13px; margin-top:4px; color:var(--primary-text-color); }
+      </style>
+      <div class="wrap">
+        <div class="section">Entities</div>
+        <ha-entity-picker id="solar_entity" label="Solar entity (ผลิตไฟ)"></ha-entity-picker>
+        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-entity-picker>
+        <div class="hint">รองรับ sensor ที่เป็น cumulative kWh (มิเตอร์สะสม) เป็นค่าเริ่มต้น</div>
+
+        <div class="section">Display</div>
+        <ha-textfield id="title" label="Title"></ha-textfield>
+        <div class="row2">
+          <ha-textfield id="solar_label" label="Solar label"></ha-textfield>
+          <ha-textfield id="usage_label" label="Usage label"></ha-textfield>
+        </div>
+        <div class="row2">
+          <ha-textfield id="chart_label" label="Chart tab (กราฟ)"></ha-textfield>
+          <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
+        </div>
+        <div class="row2">
+          <ha-textfield id="days" label="Days (3-31)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
+          <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
+        </div>
+
+        <div class="section">Data</div>
+        <ha-select id="aggregation" label="Aggregation">
+          <mwc-list-item value="delta">delta — คำนวณรายวันจากมิเตอร์สะสม</mwc-list-item>
+          <mwc-list-item value="daily">daily — entity เป็นค่ารายวันอยู่แล้ว</mwc-list-item>
+        </ha-select>
+        <div class="hint">ถ้า sensor รีเซ็ตทุกวันให้เลือก daily, ถ้าเป็นมิเตอร์สะสมให้ใช้ delta</div>
+      </div>
+    `;
+
+    const $ = (id) => this.shadowRoot.querySelector("#" + id);
+
+    // Set values as properties (not attributes) so HA web components pick them up
+    const solarPicker = $("solar_entity");
+    const usagePicker = $("usage_entity");
+    if (solarPicker) {
+      solarPicker.hass = this._hass;
+      solarPicker.value = c.solar_entity || "";
+      solarPicker.setAttribute("label", "Solar entity (ผลิตไฟ)");
+      try { solarPicker.setAttribute("domain-filter", "sensor"); } catch (e) {}
+      solarPicker.allowCustomEntity = true;
+      solarPicker.addEventListener("value-changed", e => this._update("solar_entity", e.detail.value));
+    }
+    if (usagePicker) {
+      usagePicker.hass = this._hass;
+      usagePicker.value = c.usage_entity || "";
+      try { usagePicker.setAttribute("domain-filter", "sensor"); } catch (e) {}
+      usagePicker.allowCustomEntity = true;
+      usagePicker.addEventListener("value-changed", e => this._update("usage_entity", e.detail.value));
+    }
+
+    const setField = (id, val) => {
+      const el = $(id);
+      if (el) el.value = val ?? "";
+    };
+    setField("title", c.title || "");
+    setField("solar_label", c.solar_label || "");
+    setField("usage_label", c.usage_label || "");
+    setField("chart_label", c.chart_label || "");
+    setField("list_label", c.list_label || "");
+    setField("days", c.days ?? 15);
+    setField("decimals", c.decimals ?? 1);
+
+    const onField = (id, key, isNumber) => {
+      const el = $(id);
+      if (!el) return;
+      const handler = (e) => {
+        let v = e.target.value;
+        if (isNumber) {
+          if (v === "" || v === null) { this._update(key, ""); return; }
+          const n = Number(v);
+          this._update(key, Number.isFinite(n) ? n : v);
+          return;
+        }
+        this._update(key, v);
+      };
+      el.addEventListener("input", handler);
+      el.addEventListener("change", handler);
+    };
+    onField("title", "title", false);
+    onField("solar_label", "solar_label", false);
+    onField("usage_label", "usage_label", false);
+    onField("chart_label", "chart_label", false);
+    onField("list_label", "list_label", false);
+    onField("days", "days", true);
+    onField("decimals", "decimals", true);
+
+    const agg = $("aggregation");
+    if (agg) {
+      agg.value = c.aggregation || "delta";
+      agg.addEventListener("value-changed", e => this._update("aggregation", e.detail.value));
+      agg.addEventListener("change", e => {
+        if (e.target.value) this._update("aggregation", e.target.value);
+      });
+      // fallback for older ha-select
+      agg.addEventListener("closed", () => {
+        if (agg.value && agg.value !== (this._config.aggregation || "delta")) {
+          this._update("aggregation", agg.value);
+        }
+      });
+    }
+  }
+}
+
+customElements.define("solar-energy-compare-card-editor", SolarEnergyCompareCardEditor);
 
 window.customCards = window.customCards || [];
 window.customCards.push({

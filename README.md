@@ -34,3 +34,7 @@ title: เปรียบเทียบการผลิตไฟ & การ�
 ```yaml
 aggregation: daily
 ```
+
+## Visual editor
+- รองรับ visual editor แล้ว: เพิ่ม card ผ่าน UI ได้เลย ไม่ต้องเขียน YAML
+- ฟิลด์ที่มี: Solar entity, Usage entity (entity picker), Title, Solar/Usage label, ชื่อ tab กราฟ/รายการ, Days, Decimals, Aggregation (delta/daily)
