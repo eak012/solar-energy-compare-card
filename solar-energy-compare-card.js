@@ -1,9 +1,10 @@
-/* solar-energy-compare-card.js v7
+/* solar-energy-compare-card.js v8
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
  * v6: legend shows today's values; adds solar/usage ratio bar.
  * v7: replaces ratio bar with daily diff + self-sufficiency stat boxes.
+ * v8: hardcodes stat-box labels; drops diff_label/self_label config.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -34,8 +35,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       usage_label: "ใช้ไฟ",
       chart_label: "กราฟ",
       list_label: "รายการ",
-      diff_label: "ส่วนต่างวันนี้",
-      self_label: "พึ่งพาตัวเอง",
       unit: "kWh",
       decimals: 1,
       history_hours: 24 * 17,
@@ -98,8 +97,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       usage_label: "ใช้ไฟ",
       chart_label: "กราฟ",
       list_label: "รายการ",
-      diff_label: "ส่วนต่างวันนี้",
-      self_label: "พึ่งพาตัวเอง",
       decimals: 1,
       aggregation: "delta",
     };
@@ -481,11 +478,11 @@ class SolarEnergyCompareCard extends HTMLElement {
       </div>
       <div class="stats">
         <div class="stat">
-          <div class="stat-label">${this._esc(this._config.diff_label)}</div>
+          <div class="stat-label">ส่วนต่างวันนี้</div>
           <div class="stat-value ${diffCls}">${diffText}</div>
         </div>
         <div class="stat">
-          <div class="stat-label">${this._esc(this._config.self_label)}</div>
+          <div class="stat-label">พึ่งพาตัวเอง</div>
           <div class="stat-value self">${selfPct.toFixed(1)}%</div>
         </div>
       </div>
@@ -811,10 +808,6 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
           <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield id="diff_label" label="Diff label (ส่วนต่าง)"></ha-textfield>
-          <ha-textfield id="self_label" label="Self-sufficiency label"></ha-textfield>
-        </div>
-        <div class="row2">
           <ha-textfield id="days" label="Days (3-31)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
           <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
         </div>
@@ -858,8 +851,6 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     setField("usage_label", c.usage_label || "");
     setField("chart_label", c.chart_label || "");
     setField("list_label", c.list_label || "");
-    setField("diff_label", c.diff_label || "");
-    setField("self_label", c.self_label || "");
     setField("days", c.days ?? 15);
     setField("decimals", c.decimals ?? 1);
 
@@ -884,8 +875,6 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     onField("usage_label", "usage_label", false);
     onField("chart_label", "chart_label", false);
     onField("list_label", "list_label", false);
-    onField("diff_label", "diff_label", false);
-    onField("self_label", "self_label", false);
     onField("days", "days", true);
     onField("decimals", "decimals", true);
 
