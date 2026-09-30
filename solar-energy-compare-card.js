@@ -1,4 +1,4 @@
-/* solar-energy-compare-card.js v9
+/* solar-energy-compare-card.js v11
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
@@ -6,6 +6,8 @@
  * v7: replaces ratio bar with daily diff + self-sufficiency stat boxes.
  * v8: hardcodes stat-box labels; drops diff_label/self_label config.
  * v9: caps days at 15.
+ * v10: drops stat-box label text; boxes show values only.
+ * v11: removes stat boxes entirely; legend shows today's values only.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -458,34 +460,16 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._bindEvents();
   }
 
-  // Summary header: today's values per entity + stat boxes for
-  // today's net difference and self-sufficiency.
+  // Summary header: today's values per entity (legend only).
   _summaryHtml(data) {
     const today = data && data.length ? data[data.length - 1] : null;
     const todaySolar = today ? today.solar : 0;
     const todayUsage = today ? today.usage : 0;
 
-    const diff = Math.round((todaySolar - todayUsage) * 10) / 10;
-    const diffCls = diff > 0 ? "pos" : diff < 0 ? "neg" : "zero";
-    const diffText = (diff > 0 ? "+" : diff < 0 ? "−" : "") + this._fmt(Math.abs(diff)) + " kWh";
-    const selfPct = todayUsage > 0
-      ? (Math.min(todaySolar, todayUsage) / todayUsage) * 100
-      : 0;
-
     return `
       <div class="legend">
         <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b class="legend-val">${today ? this._fmt(todaySolar) : "–"} kWh</b></span>
         <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b class="legend-val">${today ? this._fmt(todayUsage) : "–"} kWh</b></span>
-      </div>
-      <div class="stats">
-        <div class="stat">
-          <div class="stat-label">ส่วนต่างวันนี้</div>
-          <div class="stat-value ${diffCls}">${diffText}</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">พึ่งพาตัวเอง</div>
-          <div class="stat-value self">${selfPct.toFixed(1)}%</div>
-        </div>
       </div>
     `;
   }
@@ -651,7 +635,7 @@ class SolarEnergyCompareCard extends HTMLElement {
 
       .title { font-size:15px; line-height:1.25; font-weight:700; margin:0 0 8px; }
       .legend { display:flex; gap:18px; align-items:center; flex-wrap:wrap;
-        font-size:12px; margin-bottom:6px;
+        font-size:12px; margin-bottom:10px;
         color:var(--secondary-text-color, #727272); }
       .legend-val { color:var(--primary-text-color, #212121);
         font-variant-numeric:tabular-nums; }
@@ -659,20 +643,6 @@ class SolarEnergyCompareCard extends HTMLElement {
         margin-right:7px; vertical-align:-1px; }
       .dot.solar { background:var(--solar-color); }
       .dot.usage { background:var(--usage-color); }
-
-      /* Stat boxes: today's net diff + self-sufficiency */
-      .stats { display:flex; gap:8px; margin:0 0 8px; }
-      .stat { flex:1; background:rgba(127,127,127,.10);
-        border:1px solid var(--divider-color, rgba(127,127,127,.25));
-        border-radius:11px; padding:7px 10px; text-align:center; }
-      .stat-label { font-size:11px; line-height:1.4;
-        color:var(--secondary-text-color, #727272); }
-      .stat-value { font-size:16px; font-weight:700; line-height:1.4;
-        font-variant-numeric:tabular-nums; }
-      .stat-value.pos { color:var(--success-color, #43a047); }
-      .stat-value.neg { color:var(--error-color, #db4437); }
-      .stat-value.zero { color:var(--secondary-text-color, #727272); }
-      .stat-value.self { color:var(--primary-color, #1f7ae0); }
 
       /* Chart: bars+gridlines are SVG, axis labels are plain HTML so the
          browser renders them in the system font with no distortion. */
@@ -795,7 +765,7 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
       <div class="wrap">
         <div class="section">Entities</div>
         <ha-entity-picker id="solar_entity" label="Solar entity (ผลิตไฟ)"></ha-entity-picker>
-        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-textfield>
+        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-entity-picker>
         <div class="hint">รองรับ sensor ที่เป็น cumulative kWh (มิเตอร์สะสม) เป็นค่าเริ่มต้น</div>
 
         <div class="section">Display</div>
