@@ -1,7 +1,8 @@
-/* solar-energy-compare-card.js v5
+/* solar-energy-compare-card.js v6
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
+ * v6: legend shows today's values; adds solar/usage ratio bar.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -21,6 +22,10 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   setConfig(config) {
+    // Capture previous entities BEFORE overwriting so entity changes
+    // in the visual editor are detected and trigger a reload.
+    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
+    const wasMissing = this._configMissing;
     this._config = {
       days: 15,
       title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
@@ -36,8 +41,6 @@ class SolarEnergyCompareCard extends HTMLElement {
     };
     // Don't throw for missing entities — show a friendly placeholder instead.
     // This keeps getStubConfig("") working and the visual editor usable.
-    const wasMissing = this._configMissing;
-    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
     this._configMissing = !config?.solar_entity || !config?.usage_entity;
     const newEntities = `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`;
     // Fetch history when entities become valid or change
@@ -421,10 +424,7 @@ class SolarEnergyCompareCard extends HTMLElement {
 
           <div class="title">${this._esc(this._config.title)}</div>
 
-          <div class="legend">
-            <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} (kWh)</span>
-            <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} (kWh)</span>
-          </div>
+          ${this._summaryHtml(data)}
 
           ${isChart ? `
             <div class="chart-wrap">
@@ -453,6 +453,37 @@ class SolarEnergyCompareCard extends HTMLElement {
       </ha-card>
     `;
     this._bindEvents();
+  }
+
+  // Summary header: today's values per entity + a left/right ratio bar
+  // showing the solar vs usage share over the displayed period.
+  _summaryHtml(data) {
+    const today = data && data.length ? data[data.length - 1] : null;
+    const todaySolar = today ? this._fmt(today.solar) : "–";
+    const todayUsage = today ? this._fmt(today.usage) : "–";
+
+    const totalSolar = (data || []).reduce((a, d) => a + d.solar, 0);
+    const totalUsage = (data || []).reduce((a, d) => a + d.usage, 0);
+    const grand = totalSolar + totalUsage;
+    const solarPct = grand > 0 ? (totalSolar / grand) * 100 : 0;
+    const usagePct = grand > 0 ? 100 - solarPct : 0;
+
+    return `
+      <div class="legend">
+        <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b class="legend-val">${todaySolar} kWh</b></span>
+        <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b class="legend-val">${todayUsage} kWh</b></span>
+      </div>
+      <div class="ratio" title="สัดส่วนรวม ${this._esc(this._config.solar_label)} ${this._fmt(totalSolar)} kWh / ${this._esc(this._config.usage_label)} ${this._fmt(totalUsage)} kWh">
+        <div class="ratio-bar">
+          <div class="ratio-fill solar" style="width:${solarPct.toFixed(1)}%"></div>
+          <div class="ratio-fill usage" style="width:${usagePct.toFixed(1)}%"></div>
+        </div>
+        <div class="ratio-labels">
+          <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b>${solarPct.toFixed(1)}%</b></span>
+          <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b>${usagePct.toFixed(1)}%</b></span>
+        </div>
+      </div>
+    `;
   }
 
   _listHtml(data) {
@@ -618,10 +649,24 @@ class SolarEnergyCompareCard extends HTMLElement {
       .legend { display:flex; gap:18px; align-items:center; flex-wrap:wrap;
         font-size:12px; margin-bottom:6px;
         color:var(--secondary-text-color, #727272); }
+      .legend-val { color:var(--primary-text-color, #212121);
+        font-variant-numeric:tabular-nums; }
       .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
         margin-right:7px; vertical-align:-1px; }
       .dot.solar { background:var(--solar-color); }
       .dot.usage { background:var(--usage-color); }
+
+      /* Ratio bar: left/right share of solar vs usage over the shown period */
+      .ratio { margin:0 0 8px; }
+      .ratio-bar { display:flex; height:12px; border-radius:8px; overflow:hidden;
+        background:rgba(127,127,127,.20); margin-bottom:6px; }
+      .ratio-fill { height:100%; transition:width .3s ease; }
+      .ratio-fill.solar { background:var(--solar-color); }
+      .ratio-fill.usage { background:var(--usage-color); }
+      .ratio-labels { display:flex; justify-content:space-between; align-items:center;
+        font-size:12px; color:var(--secondary-text-color, #727272); }
+      .ratio-labels b { color:var(--primary-text-color, #212121);
+        font-variant-numeric:tabular-nums; }
 
       /* Chart: bars+gridlines are SVG, axis labels are plain HTML so the
          browser renders them in the system font with no distortion. */
