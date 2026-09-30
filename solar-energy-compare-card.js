@@ -1,4 +1,4 @@
-/* solar-energy-compare-card.js v4
+/* solar-energy-compare-card.js v5
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
@@ -8,42 +8,66 @@ class SolarEnergyCompareCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
-    this._config = {};
+    this._config = null;
     this._hass = null;
     this._data = [];
-    this._loading = false;
+    this._loading = true;
     this._error = null;
     this._selected = null;
-    this._view = "chart"; // 'chart' | 'list'
-    this._timer = null;
+    this._lastStateKey = null;
+    this._loadedOnce = false;
+    this._configMissing = false;
+    this._configTimer = null;
+    this._refreshTimer = null;
+    this._lastFetch = 0;
+    this._view = "chart";
   }
 
-  setConfig(config) {
-    this._config = {
-      days: 15,
+  static getConfigElement() {
+    return document.createElement("solar-energy-compare-card-editor");
+  }
+
+  static getStubConfig() {
+    return {
+      solar_entity: "",
+      usage_entity: "",
       title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
       solar_label: "ผลิตไฟ",
       usage_label: "ใช้ไฟ",
       chart_label: "กราฟ",
       list_label: "รายการ",
-      unit: "kWh",
+      days: 15,
       decimals: 1,
-      history_hours: 24 * 17,
+      aggregation: "delta",
+    };
+  }
+
+  setConfig(config) {
+    const prevEntities = this._config
+      ? `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`
+      : null;
+    const wasMissing = this._configMissing;
+    this._config = {
+      title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
+      solar_label: "ผลิตไฟ",
+      usage_label: "ใช้ไฟ",
+      chart_label: "กราฟ",
+      list_label: "รายการ",
+      days: 15,
+      decimals: 1,
       aggregation: "delta",
       ...config,
     };
-    // Don't throw for missing entities — show a friendly placeholder instead.
-    // This keeps getStubConfig("") working and the visual editor usable.
-    const wasMissing = this._configMissing;
-    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
-    this._configMissing = !config?.solar_entity || !config?.usage_entity;
+    // Don't throw while the user is still picking entities in the visual
+    // editor — show a friendly placeholder instead.
+    this._configMissing = !(this._config.solar_entity && this._config.usage_entity);
     const newEntities = `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`;
     // Fetch history when entities become valid or change
     if (!this._configMissing && this._hass) {
       if (wasMissing || !this._loadedOnce || prevEntities !== newEntities) {
         this._loadedOnce = true;
-        clearTimeout(this._timer);
-        this._timer = setTimeout(() => this._loadHistory(), 300);
+        clearTimeout(this._configTimer);
+        this._configTimer = setTimeout(() => this._loadHistory(), 300);
       }
     }
     this._render();
@@ -55,310 +79,242 @@ class SolarEnergyCompareCard extends HTMLElement {
     if (!this._loadedOnce) {
       this._loadedOnce = true;
       this._loadHistory();
-    } else {
+      return;
+    }
+    if (this._config) {
       const s = hass.states?.[this._config.solar_entity];
       const u = hass.states?.[this._config.usage_entity];
       const key = `${s?.state}|${u?.state}`;
-      if (key !== this._lastStateKey) {
-        this._lastStateKey = key;
-        clearTimeout(this._timer);
-        this._timer = setTimeout(() => this._loadHistory(), 1500);
-      }
+      if (key === this._lastStateKey) return;
+      this._lastStateKey = key;
+      // Throttle background refresh: at most once every 5 minutes so the
+      // chart never blinks while data is being refreshed.
+      if (this._refreshTimer) return;
+      const elapsed = Date.now() - (this._lastFetch || 0);
+      const delay = elapsed >= 5 * 60 * 1000 ? 2000 : 5 * 60 * 1000 - elapsed;
+      this._refreshTimer = setTimeout(() => {
+        this._refreshTimer = null;
+        this._loadHistory();
+      }, delay);
     }
   }
 
-  getCardSize() { return 4; }
-
-  static getConfigElement() {
-    return document.createElement("solar-energy-compare-card-editor");
-  }
-
-  static getStubConfig() {
-    return {
-      type: "custom:solar-energy-compare-card",
-      solar_entity: "",
-      usage_entity: "",
-      days: 15,
-      title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
-      solar_label: "ผลิตไฟ",
-      usage_label: "ใช้ไฟ",
-      chart_label: "กราฟ",
-      list_label: "รายการ",
-      decimals: 1,
-      aggregation: "delta",
-    };
+  getCardSize() {
+    return this._view === "list" ? 6 : 5;
   }
 
   async _loadHistory() {
     if (!this._hass || this._loading || this._configMissing) return;
+    // Only show the loading skeleton on the very first load. Background
+    // refreshes keep the existing chart visible so nothing blinks.
+    const firstLoad = this._data.length === 0;
     this._loading = true;
     this._error = null;
-    this._render();
+    this._lastFetch = Date.now();
+    if (firstLoad) this._render();
     try {
-      const days = Math.max(3, Math.min(31, Number(this._config.days) || 15));
-      const now = new Date();
-      // +3 days buffer: delta needs the previous day's last reading
-      const start = new Date(now.getTime() - (days + 3) * 24 * 3600 * 1000);
-
-      const [solarHistory, usageHistory] = await Promise.all([
-        this._fetchHistory(this._config.solar_entity, start),
-        this._fetchHistory(this._config.usage_entity, start),
+      const days = Number(this._config.days) || 15;
+      // Buffer days so "last reading of previous day" deltas work.
+      const hours = (days + 3) * 24;
+      const [solarHist, usageHist] = await Promise.all([
+        this._fetchHistory(this._config.solar_entity, hours),
+        this._fetchHistory(this._config.usage_entity, hours),
       ]);
-
-      // Fallback: long-term statistics. Recorder keeps only ~10 days of raw
-      // history by default (and some entities are excluded from recorder),
-      // but energy sensors almost always have long-term statistics.
-      let solarStat = null;
-      let usageStat = null;
-      if (!solarHistory.length) {
-        solarStat = await this._fetchDailyStatistics(this._config.solar_entity, days).catch(() => null);
+      let data = this._buildDaily(
+        solarHist, usageHist, days, this._config.aggregation
+      );
+      if (!data.length) {
+        // Fallback: long-term statistics (survives recorder purge).
+        const [solarStats, usageStats] = await Promise.all([
+          this._fetchStatistics(this._config.solar_entity, days),
+          this._fetchStatistics(this._config.usage_entity, days),
+        ]);
+        data = this._buildDailyFromStats(solarStats, usageStats, days);
       }
-      if (!usageHistory.length) {
-        usageStat = await this._fetchDailyStatistics(this._config.usage_entity, days).catch(() => null);
+      console.info(
+        `[solar-energy-compare-card] history points: solar=${solarHist.length}, usage=${usageHist.length} | daily rows=${data.length}`
+      );
+      if (!data.length) {
+        console.warn(
+          "[solar-energy-compare-card] No data from recorder history or long-term statistics. " +
+          "Check that the entities are recorded (recorder include/exclude) and have statistics."
+        );
       }
-
-      console.debug("[solar-energy-compare-card] history points:",
-        this._config.solar_entity, solarHistory.length,
-        this._config.usage_entity, usageHistory.length,
-        "| stat days:", solarStat?.size ?? "-", usageStat?.size ?? "-");
-
-      const all = this._buildDailyData(solarHistory, usageHistory, solarStat, usageStat);
-      this._data = all.slice(-days);
-
-      if (!this._data.length) {
-        console.warn("[solar-energy-compare-card] no daily data. Check that the entity_ids exist and are recorded (recorder) or have long-term statistics:",
-          this._config.solar_entity, this._config.usage_entity);
-      }
-      if (this._data.length) {
-        if (!this._selected || !this._data.some(d => d.date === this._selected)) {
-          this._selected = this._data[this._data.length - 1].date;
+      this._data = data;
+      if (data.length) {
+        if (!this._selected || !data.some(d => d.date === this._selected)) {
+          this._selected = data[data.length - 1].date;
         }
       }
-    } catch (e) {
-      console.error("[solar-energy-compare-card]", e);
-      this._error = e?.message || String(e);
+    } catch (err) {
+      console.error("[solar-energy-compare-card] load failed:", err);
+      this._error = err?.message || String(err);
     } finally {
       this._loading = false;
       this._render();
     }
   }
 
-  _fetchHistory(entityId, start) {
-    return this._hass.callWS({
-      type: "history/history_during_period",
-      start_time: start.toISOString(),
-      end_time: new Date().toISOString(),
-      entity_ids: [entityId],
-      minimal_response: false,
-      no_attributes: true,
-      significant_changes_only: false,
-    }).then(result => {
-      if (!result) return [];
-      if (Array.isArray(result)) {
-        const found = result.find(r => r && r.entity_id === entityId);
-        return (found && (found.states || found.data)) || [];
-      }
-      return result[entityId] || [];
-    }).catch(err => {
-      console.warn("[solar-energy-compare-card] history failed for", entityId, err?.message || err);
-      return [];
+  async _fetchHistory(entityId, hours) {
+    const end = new Date();
+    const start = new Date(end.getTime() - hours * 3600 * 1000);
+    const url =
+      `/api/history/period/${start.toISOString()}?` +
+      `filter_entity_id=${encodeURIComponent(entityId)}&end_time=${encodeURIComponent(end.toISOString())}&minimal_response`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${this._getToken()}` },
     });
+    if (!res.ok) throw new Error(`history HTTP ${res.status}`);
+    const json = await res.json();
+    // HA returns an array of arrays (one per entity); be defensive.
+    const flat = Array.isArray(json) ? json.flat() : [];
+    return flat
+      .map(r => ({
+        t: this._parseTime(r),
+        v: Number(r.state ?? r.s),
+      }))
+      .filter(p => Number.isFinite(p.t) && Number.isFinite(p.v))
+      .sort((a, b) => a.t - b.t);
   }
 
-  // Long-term statistics fallback -> Map("YYYY-MM-DD" -> kWh used that day).
-  // Prefers per-day `change` (already a daily delta); otherwise diffs the
-  // cumulative `sum`/`state` of consecutive days.
-  async _fetchDailyStatistics(entityId, days) {
+  _parseTime(r) {
+    const raw = r.last_changed ?? r.lc ?? r.last_updated ?? r.lu ?? r.t;
+    if (typeof raw === "number") return raw < 1e12 ? raw * 1000 : raw;
+    const t = Date.parse(raw);
+    return Number.isFinite(t) ? t : NaN;
+  }
+
+  async _fetchStatistics(entityId, days) {
     const end = new Date();
-    const start = new Date(end.getTime() - (days + 2) * 24 * 3600 * 1000);
-    const num = (v) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-    const toMs = (t) => {
-      if (t == null) return NaN;
-      if (typeof t === "number") return t < 1e12 ? t * 1000 : t;
-      return Date.parse(t);
-    };
-    const callStats = (types) => this._hass.callWS({
+    end.setHours(23, 59, 59, 999);
+    const start = new Date(end);
+    start.setDate(start.getDate() - (days - 1));
+    start.setHours(0, 0, 0, 0);
+    const msg = {
       type: "recorder/statistics_during_period",
       start_time: start.toISOString(),
       end_time: end.toISOString(),
-      period: "day",
       statistic_ids: [entityId],
-      ...(types ? { statistic_types: types } : {}),
-    });
+      period: "day",
+      units: { energy: "kWh" },
+    };
+    const res = await this._hass.callWS(msg);
+    const rows = res?.[entityId] || [];
+    return rows.map(r => {
+      const startTs = Date.parse(r.start);
+      const change = Number(r.change);
+      let value;
+      if (Number.isFinite(change)) value = change;
+      else if (Number.isFinite(Number(r.sum)) && Number.isFinite(Number(r.mean))) value = Number(r.sum);
+      else value = Number(r.state);
+      return { t: startTs, v: value };
+    }).filter(p => Number.isFinite(p.t) && Number.isFinite(p.v));
+  }
 
-    let result;
+  _getToken() {
+    // Prefer the hass connection auth; fallback to localStorage (frontend).
     try {
-      result = await callStats(["change", "sum", "state"]);
-    } catch (e) {
-      result = await callStats(null); // older HA without "change" type
-    }
-
-    const rows = (result?.[entityId] || [])
-      .map(r => ({
-        ms: toMs(r.start),
-        change: num(r.change),
-        sum: num(r.sum),
-        state: num(r.state),
-      }))
-      .filter(r => Number.isFinite(r.ms))
-      .sort((a, b) => a.ms - b.ms);
-
-    const map = new Map();
-    let prevSum = null;
-    let prevState = null;
-    for (const r of rows) {
-      const key = this._localDateKey(new Date(r.ms));
-      let daily = null;
-      if (r.change != null) {
-        daily = Math.max(0, r.change);
-      } else if (r.sum != null && prevSum != null) {
-        daily = r.sum - prevSum;
-        if (daily < 0) daily = Math.max(0, r.sum); // counter reset
-      } else if (r.state != null && prevState != null) {
-        daily = r.state - prevState;
-        if (daily < 0) daily = Math.max(0, r.state);
-      }
-      if (daily != null && Number.isFinite(daily)) map.set(key, Math.max(0, daily));
-      if (r.sum != null) prevSum = r.sum;
-      if (r.state != null) prevState = r.state;
-    }
-    return map;
+      const conn = this._hass?.connection;
+      const token = conn?.options?.auth?.data?.access_token;
+      if (token) return token;
+    } catch { /* ignore */ }
+    try {
+      const raw = localStorage.getItem("hassTokens");
+      if (raw) return JSON.parse(raw).access_token || "";
+    } catch { /* ignore */ }
+    return "";
   }
 
-  _buildDailyData(solarPts, usagePts, solarStat, usageStat) {
-    if (this._config.aggregation === "daily") {
-      return this._buildDailyLastValue(solarPts, usagePts);
-    }
-    return this._buildDeltaDaily(solarPts, usagePts, solarStat, usageStat);
+  _dayKey(ts) {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
 
-  // delta mode: daily = last reading of the day − last reading of the
-  // previous day. Works with sparse history (even 1 reading/day).
-  // Entities with no recorder history fall back to long-term statistics.
-  _buildDeltaDaily(solarPts, usagePts, solarStat, usageStat) {
-    const perEntity = (pts) => {
-      const norm = this._normaliseHistory(pts);
-      const lastByDate = new Map();
-      for (const p of norm) lastByDate.set(p.date, p.value);
-      const dates = [...lastByDate.keys()].sort();
-      const out = new Map();
-      let prev = null;
-      for (const d of dates) {
-        const cur = lastByDate.get(d);
-        if (prev != null && cur != null) {
-          let delta = cur - prev;
-          if (delta < 0) {
-            // counter reset across the gap: use within-day positive movement
-            delta = this._withinDayGain(norm, d);
-            if (!(delta > 0)) delta = Math.max(0, cur);
-          }
-          out.set(d, Math.max(0, delta));
-        }
-        if (cur != null) prev = cur;
+  _buildDaily(solarHist, usageHist, days, aggregation) {
+    const groupByDay = (hist) => {
+      const map = new Map();
+      for (const p of hist) {
+        const k = this._dayKey(p.t);
+        if (!map.has(k)) map.set(k, []);
+        map.get(k).push(p);
       }
-      return out;
+      return map;
+    };
+    const solarByDay = groupByDay(solarHist);
+    const usageByDay = groupByDay(usageHist);
+
+    const lastOf = (arr) => arr[arr.length - 1].v;
+    const firstOf = (arr) => arr[0].v;
+
+    const keys = [];
+    const today = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      keys.push(this._dayKey(d.getTime()));
+    }
+    // Include one extra previous day so sparse sensors (e.g. one reading
+    // per day) still produce a delta for the first visible day.
+    const prevKey = (() => {
+      const d = new Date(today);
+      d.setDate(d.getDate() - days);
+      return this._dayKey(d.getTime());
+    })();
+
+    const deltaFor = (byDay, key, prevK) => {
+      const cur = byDay.get(key);
+      const prev = byDay.get(prevK);
+      if (!cur || !cur.length) return 0;
+      if (prev && prev.length) {
+        const delta = lastOf(cur) - lastOf(prev);
+        return delta >= 0 ? delta : Math.max(0, lastOf(cur)); // counter reset
+      }
+      // Fallback: intra-day delta when there is no previous-day reading.
+      const delta = lastOf(cur) - firstOf(cur);
+      return delta > 0 ? delta : 0;
+    };
+    const dailyValueFor = (byDay, key) => {
+      const cur = byDay.get(key);
+      if (!cur || !cur.length) return 0;
+      return Math.max(0, lastOf(cur));
     };
 
-    const sD = perEntity(solarPts);
-    const uD = perEntity(usagePts);
-
-    const useStatS = sD.size === 0 && solarStat && solarStat.size > 0;
-    const useStatU = uD.size === 0 && usageStat && usageStat.size > 0;
-
-    const dates = new Set([
-      ...sD.keys(),
-      ...uD.keys(),
-      ...(useStatS ? solarStat.keys() : []),
-      ...(useStatU ? usageStat.keys() : []),
-    ]);
-    return [...dates].sort().map(date => ({
-      date,
-      solar: this._safe(useStatS ? (solarStat.get(date) ?? 0) : (sD.get(date) ?? 0)),
-      usage: this._safe(useStatU ? (usageStat.get(date) ?? 0) : (uD.get(date) ?? 0)),
-    }));
-  }
-
-  _buildDailyLastValue(solarPts, usagePts) {
-    const lastByDate = (pts) => {
-      const m = new Map();
-      for (const p of this._normaliseHistory(pts)) m.set(p.date, p.value);
-      return m;
-    };
-    const sM = lastByDate(solarPts);
-    const uM = lastByDate(usagePts);
-    const dates = new Set([...sM.keys(), ...uM.keys()]);
-    return [...dates].sort().map(date => ({
-      date,
-      solar: this._safe(sM.get(date) ?? 0),
-      usage: this._safe(uM.get(date) ?? 0),
-    }));
-  }
-
-  _withinDayGain(norm, date) {
-    let gain = 0;
-    let prev = null;
-    for (const p of norm) {
-      if (p.date !== date) continue;
-      if (prev != null && p.value > prev) gain += p.value - prev;
-      prev = p.value;
-    }
-    return gain;
-  }
-
-  _normaliseHistory(history) {
-    return (history || [])
-      .map(item => {
-        const value = Number.parseFloat(item.state ?? item.s);
-        let ms = Date.parse(item.last_changed || item.last_updated || "");
-        if (!Number.isFinite(ms)) {
-          const lc = item.lc ?? item.lu;
-          const n = Number(lc);
-          if (Number.isFinite(n)) ms = n < 1e12 ? n * 1000 : n;
-        }
-        const dt = new Date(ms);
-        return {
-          value,
-          dt,
-          date: Number.isFinite(ms) ? this._localDateKey(dt) : null,
-        };
-      })
-      .filter(x => Number.isFinite(x.value) && x.date)
-      .sort((a, b) => a.dt - b.dt);
-  }
-
-  _localDateKey(date) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, "0");
-    const d = String(date.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-  }
-
-  _safe(v) { return Number.isFinite(v) ? Math.max(0, v) : 0; }
-
-  _fmt(v) {
-    return Number(v || 0).toLocaleString("th-TH", {
-      minimumFractionDigits: this._config.decimals,
-      maximumFractionDigits: this._config.decimals,
+    return keys.map((key, idx) => {
+      const prevK = idx === 0 ? prevKey : keys[idx - 1];
+      const solar = aggregation === "daily"
+        ? dailyValueFor(solarByDay, key)
+        : deltaFor(solarByDay, key, prevK);
+      const usage = aggregation === "daily"
+        ? dailyValueFor(usageByDay, key)
+        : deltaFor(usageByDay, key, prevK);
+      return { date: key, solar, usage };
     });
   }
 
-  _dayLabel(dateKey) {
-    const [y, m, d] = dateKey.split("-").map(Number);
-    const dt = new Date(y, m - 1, d);
-    return {
-      day: String(d),
-      month: dt.toLocaleDateString("th-TH", { month: "short" }).replace(".", ""),
+  _buildDailyFromStats(solarStats, usageStats, days) {
+    const toMap = (stats) => {
+      const map = new Map();
+      for (const p of stats) map.set(this._dayKey(p.t), p.v);
+      return map;
     };
-  }
-
-  _dateFull(dateKey) {
-    const [y, m, d] = dateKey.split("-").map(Number);
-    return new Date(y, m - 1, d).toLocaleDateString("th-TH", {
-      day: "numeric", month: "short", year: "numeric",
-    });
+    const sMap = toMap(solarStats);
+    const uMap = toMap(usageStats);
+    const today = new Date();
+    const out = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const key = this._dayKey(d.getTime());
+      out.push({
+        date: key,
+        solar: Math.max(0, sMap.get(key) || 0),
+        usage: Math.max(0, uMap.get(key) || 0),
+      });
+    }
+    // Drop leading all-zero days that are just "no data yet".
+    let first = out.findIndex(r => r.solar > 0 || r.usage > 0);
+    if (first === -1) return [];
+    return out.slice(first);
   }
 
   _setView(view) {
@@ -368,15 +324,13 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   _render() {
-    if (!this.shadowRoot) return;
     const style = `<style>${this._css()}</style>`;
-
+    if (!this.shadowRoot) return;
     if (this._configMissing) {
-      this.shadowRoot.innerHTML = `${style}<ha-card><div class="empty" style="padding:28px 16px;">กรุณาเลือก solar_entity และ usage_entity<br><small>เปิด Visual editor เพื่อเลือก entity</small></div></ha-card>`;
+      this.shadowRoot.innerHTML = `${style}<ha-card><div class="empty">กรุณาเลือก entity สำหรับการผลิตไฟและการใช้ไฟ<br><small>เปิด Visual editor แล้วเลือก entity ทั้งสองช่อง</small></div></ha-card>`;
       return;
     }
-
-    if (this._loading) {
+    if (this._loading && this._data.length === 0) {
       this.shadowRoot.innerHTML = `${style}<ha-card><div class="loading">กำลังโหลดข้อมูล...</div></ha-card>`;
       return;
     }
@@ -387,8 +341,8 @@ class SolarEnergyCompareCard extends HTMLElement {
 
     const data = this._data || [];
     const max = Math.max(1, ...data.flatMap(d => [d.solar, d.usage]));
-    const selected = data.find(d => d.date === this._selected) || data[data.length - 1];
     const isChart = this._view === "chart";
+    const yTicks = [0, 1, 2, 3, 4].map(i => max * i / 4);
 
     this.shadowRoot.innerHTML = `
       ${style}
@@ -407,23 +361,23 @@ class SolarEnergyCompareCard extends HTMLElement {
           </div>
 
           ${isChart ? `
-            <div class="chart-wrap" id="chart">
-              ${this._chartSvg(data, max)}
-              <div class="tooltip" id="tooltip"></div>
-            </div>
-            ${selected ? `
-              <div class="selected">
-                <div class="selected-date">${this._dateFull(selected.date)}</div>
-                <div class="selected-row">
-                  <span><i class="dot solar"></i>${this._esc(this._config.solar_label)}</span>
-                  <strong>${this._fmt(selected.solar)} kWh</strong>
+            <div class="chart-wrap">
+              <div class="chart-body">
+                <div class="y-axis">
+                  ${yTicks.map((v, i) => `<span style="bottom:${i * 25}%">${this._fmtTick(v)}</span>`).join("")}
                 </div>
-                <div class="selected-row">
-                  <span><i class="dot usage"></i>${this._esc(this._config.usage_label)}</span>
-                  <strong>${this._fmt(selected.usage)} kWh</strong>
+                <div class="plot" id="plot">
+                  ${this._chartSvg(data, max)}
+                  <div class="tooltip" id="tooltip"></div>
                 </div>
               </div>
-            ` : ""}
+              <div class="x-axis">
+                ${data.map(d => {
+                  const l = this._dayLabel(d.date);
+                  return `<div class="x-col"><b>${l.day}</b><span>${this._esc(l.month)}</span></div>`;
+                }).join("")}
+              </div>
+            </div>
           ` : `
             <div class="list-wrap" id="list">
               ${this._listHtml(data)}
@@ -468,46 +422,35 @@ class SolarEnergyCompareCard extends HTMLElement {
 
   _chartSvg(data, max) {
     if (!data.length) return `<div class="empty">ยังไม่มีข้อมูลย้อนหลัง<br><small>ตรวจสอบว่า entity_id ถูกต้อง และ sensor ถูกบันทึกใน recorder หรือมี long-term statistics<br>ดูรายละเอียดใน browser console (F12)</small></div>`;
-    const W = 700, H = 245;
-    const padL = 35, padR = 8, padT = 10, padB = 42;
-    const chartW = W - padL - padR;
-    const chartH = H - padT - padB;
-    const groupW = chartW / data.length;
+    // No text inside the SVG: axis labels are HTML so the browser renders
+    // them in the system font without non-uniform stretching.
+    const W = 700, H = 200;
+    const groupW = W / data.length;
     const gap = Math.min(5, groupW * 0.10);
     const barW = Math.max(3, (groupW - gap * 3) / 2);
-    const baseY = padT + chartH;
 
     let svg = `
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="chart-svg"
            role="img" aria-label="กราฟเปรียบเทียบการผลิตไฟและการใช้ไฟย้อนหลัง">
-        <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${baseY}" class="axis"/>
-        <line x1="${padL}" y1="${baseY}" x2="${W-padR}" y2="${baseY}" class="axis"/>
     `;
     for (let i = 0; i <= 4; i++) {
-      const value = max * (i / 4);
-      const y = baseY - chartH * (i / 4);
-      svg += `
-        <line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" class="grid"/>
-        <text x="${padL - 7}" y="${y + 4}" text-anchor="end" class="y-label">${this._fmt(value).replace(/,0$/, "")}</text>
-      `;
+      const y = H - H * (i / 4);
+      svg += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" class="grid"/>`;
     }
     data.forEach((d, i) => {
-      const center = padL + groupW * i + groupW / 2;
-      const solarH = chartH * (d.solar / max);
-      const usageH = chartH * (d.usage / max);
+      const center = groupW * i + groupW / 2;
+      const solarH = H * (d.solar / max);
+      const usageH = H * (d.usage / max);
       const solarX = center - barW - gap / 2;
       const usageX = center + gap / 2;
-      const solarY = baseY - solarH;
-      const usageY = baseY - usageH;
+      const solarY = H - solarH;
+      const usageY = H - usageH;
       const active = d.date === this._selected ? " active" : "";
-      const label = this._dayLabel(d.date);
       svg += `
         <g class="day-group${active}" data-date="${d.date}">
-          <rect class="hit" x="${padL + groupW*i}" y="${padT}" width="${groupW}" height="${chartH + padB}" rx="4"/>
-          <rect class="bar solar-bar" x="${solarX}" y="${solarY}" width="${barW}" height="${Math.max(1, solarH)}" rx="2"/>
-          <rect class="bar usage-bar" x="${usageX}" y="${usageY}" width="${barW}" height="${Math.max(1, usageH)}" rx="2"/>
-          <text x="${center}" y="${baseY + 17}" text-anchor="middle" class="x-day">${label.day}</text>
-          <text x="${center}" y="${baseY + 31}" text-anchor="middle" class="x-month">${label.month}</text>
+          <rect class="hit" x="${groupW*i}" y="0" width="${groupW}" height="${H}" rx="4"/>
+          <rect class="bar solar-bar" x="${solarX.toFixed(1)}" y="${solarY.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1.5, solarH).toFixed(1)}" rx="2"/>
+          <rect class="bar usage-bar" x="${usageX.toFixed(1)}" y="${usageY.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1.5, usageH).toFixed(1)}" rx="2"/>
         </g>
       `;
     });
@@ -530,33 +473,32 @@ class SolarEnergyCompareCard extends HTMLElement {
       return;
     }
 
-    const chart = this.shadowRoot.querySelector("#chart");
+    const plot = this.shadowRoot.querySelector("#plot");
     const tooltip = this.shadowRoot.querySelector("#tooltip");
-    if (!chart || !tooltip) return;
+    if (!plot || !tooltip) return;
 
+    // Hover shows a popup tooltip only — no full re-render, so the chart
+    // never blinks while hovering.
     const show = (date, event) => {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
       this._selected = date;
-      // re-render to update highlight + selected panel, then show tooltip
-      this._render();
-      const newChart = this.shadowRoot.querySelector("#chart");
-      const newTooltip = this.shadowRoot.querySelector("#tooltip");
-      if (!newChart || !newTooltip) return;
-      const rect = newChart.getBoundingClientRect();
+      this.shadowRoot.querySelectorAll(".day-group").forEach(g =>
+        g.classList.toggle("active", g.dataset.date === date));
+      const rect = plot.getBoundingClientRect();
       const x = (event?.clientX ?? rect.left + rect.width / 2) - rect.left;
       const y = (event?.clientY ?? rect.top + 20) - rect.top;
-      newTooltip.innerHTML = `
+      tooltip.innerHTML = `
         <div class="tip-date">${this._dateFull(d.date)}</div>
-        <div><i class="dot solar"></i>โซลาร์เซลล์ <b>${this._fmt(d.solar)} kWh</b></div>
-        <div><i class="dot usage"></i>ใช้ไฟ <b>${this._fmt(d.usage)} kWh</b></div>
+        <div><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b>${this._fmt(d.solar)} kWh</b></div>
+        <div><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b>${this._fmt(d.usage)} kWh</b></div>
       `;
-      newTooltip.classList.add("show");
+      tooltip.classList.add("show");
       const tw = 170;
       let left = x - tw / 2;
       left = Math.max(4, Math.min(rect.width - tw - 4, left));
-      newTooltip.style.left = `${left}px`;
-      newTooltip.style.top = `${Math.max(4, y - 78)}px`;
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${Math.max(4, y - 78)}px`;
     };
 
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
@@ -564,14 +506,13 @@ class SolarEnergyCompareCard extends HTMLElement {
       group.addEventListener("pointermove", e => {
         const tt = this.shadowRoot.querySelector("#tooltip");
         if (!tt?.classList.contains("show")) return;
-        const rect = chart.getBoundingClientRect();
+        const rect = plot.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const tw = 170;
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
       });
       group.addEventListener("pointerleave", () => {
-        const tt = this.shadowRoot.querySelector("#tooltip");
-        if (tt) tt.classList.remove("show");
+        tooltip.classList.remove("show");
       });
       group.addEventListener("click", e => show(group.dataset.date, e));
       group.addEventListener("touchstart", e => {
@@ -589,91 +530,135 @@ class SolarEnergyCompareCard extends HTMLElement {
 
   _css() {
     return `
-      :host { display:block; --solar-color:#ffbd32; --usage-color:#2389ff;
-        --card-bg:#071d31; --text:#f5f7fb; --muted:#91a2b6; }
-      ha-card { overflow:hidden; border-radius:16px; background:var(--card-bg);
-        color:var(--text); border:1px solid rgba(72,150,220,.30); box-shadow:none; }
-      .wrap { padding:14px 14px 13px; position:relative; }
+      :host { display:block; --solar-color:#ffbd32; --usage-color:#2389ff; }
+      /* No background override: the card uses the app/theme background.
+         Text colors follow Home Assistant theme variables. */
+      ha-card { overflow:hidden; border-radius:16px;
+        color:var(--primary-text-color, #212121); }
+      .wrap { padding:12px 12px 10px; position:relative; }
 
-      /* Tabs - match mock */
-      .tabs { display:flex; background:rgba(20,45,70,.85); border-radius:12px;
-        padding:4px; margin-bottom:14px; gap:4px; }
-      .tab { flex:1; border:0; border-radius:9px; padding:9px 0; font-size:14px;
-        font-weight:600; background:transparent; color:#8ea3b8; cursor:pointer;
+      /* Tabs */
+      .tabs { display:flex; background:rgba(127,127,127,.18); border-radius:12px;
+        padding:4px; margin-bottom:10px; gap:4px; }
+      .tab { flex:1; border:0; border-radius:9px; padding:7px 0; font-size:13px;
+        font-weight:600; background:transparent;
+        color:var(--secondary-text-color, #727272); cursor:pointer;
         transition:background .15s ease, color .15s ease; }
-      .tab.active { background:#1f7ae0; color:#fff; box-shadow:0 2px 8px rgba(31,122,224,.45); }
-      .tab:not(.active):hover { color:#c9d8e8; }
+      .tab.active { background:var(--primary-color, #1f7ae0);
+        color:var(--text-primary-color, #fff);
+        box-shadow:0 2px 8px rgba(0,0,0,.25); }
 
-      .title { font-size:17px; line-height:1.25; font-weight:700; margin:0 0 14px; }
-      .legend { display:flex; gap:22px; align-items:center; flex-wrap:wrap;
-        color:#dbe6f2; font-size:13px; margin-bottom:8px; }
-      .dot { display:inline-block; width:11px; height:11px; border-radius:50%;
-        margin-right:8px; vertical-align:-1px; }
+      .title { font-size:15px; line-height:1.25; font-weight:700; margin:0 0 8px; }
+      .legend { display:flex; gap:18px; align-items:center; flex-wrap:wrap;
+        font-size:12px; margin-bottom:6px;
+        color:var(--secondary-text-color, #727272); }
+      .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+        margin-right:7px; vertical-align:-1px; }
       .dot.solar { background:var(--solar-color); }
       .dot.usage { background:var(--usage-color); }
 
-      .chart-wrap { position:relative; width:100%; height:245px; touch-action:pan-y; }
-      .chart-svg { display:block; width:100%; height:100%; overflow:visible; }
-      .grid { stroke:rgba(185,207,230,.13); stroke-width:1; vector-effect:non-scaling-stroke; }
-      .axis { stroke:rgba(185,207,230,.20); stroke-width:1; vector-effect:non-scaling-stroke; }
-      .y-label { fill:#9aabba; font-size:11px; }
-      .x-day { fill:#e1e9f2; font-size:11px; font-weight:500; }
-      .x-month { fill:#8294a8; font-size:10px; }
-      .bar { vector-effect:non-scaling-stroke; }
+      /* Chart: bars+gridlines are SVG, axis labels are plain HTML so the
+         browser renders them in the system font with no distortion. */
+      .chart-wrap { width:100%; touch-action:pan-y; }
+      .chart-body { display:flex; height:160px; }
+      .y-axis { position:relative; width:36px; flex-shrink:0; }
+      .y-axis span { position:absolute; right:6px; transform:translateY(50%);
+        font-size:11px; line-height:1; white-space:nowrap;
+        color:var(--secondary-text-color, #727272);
+        font-variant-numeric:tabular-nums; }
+      .plot { flex:1; position:relative; min-width:0; }
+      .chart-svg { display:block; width:100%; height:100%; }
+      .grid { stroke:var(--divider-color, rgba(127,127,127,.35)); stroke-width:1; }
+      .bar { }
       .solar-bar { fill:var(--solar-color); }
       .usage-bar { fill:var(--usage-color); }
       .hit { fill:transparent; cursor:pointer; }
       .day-group.active .hit { fill:rgba(42,137,255,.10); stroke:rgba(42,137,255,.50); stroke-width:1; }
-      .day-group.active .solar-bar, .day-group.active .usage-bar { filter:brightness(1.12); }
+      .day-group.active .solar-bar, .day-group.active .usage-bar { filter:brightness(1.08); }
+      .x-axis { display:flex; margin-left:36px; margin-top:5px; }
+      .x-col { flex:1; min-width:0; text-align:center; }
+      .x-col b { display:block; font-size:11px; font-weight:500; line-height:1.3;
+        font-variant-numeric:tabular-nums; }
+      .x-col span { display:block; font-size:10px; line-height:1.3;
+        color:var(--secondary-text-color, #727272); white-space:nowrap;
+        overflow:hidden; text-overflow:ellipsis; }
 
       .tooltip { position:absolute; z-index:10; width:170px; box-sizing:border-box;
-        padding:10px 11px; border-radius:11px; background:rgba(8,25,42,.97);
-        border:1px solid rgba(100,170,235,.38); box-shadow:0 8px 24px rgba(0,0,0,.35);
-        color:#f4f7fb; font-size:12px; line-height:1.8; pointer-events:none;
-        opacity:0; transform:translateY(4px); transition:opacity .12s ease, transform .12s ease; }
+        padding:9px 11px; border-radius:11px;
+        background:var(--card-background-color, #fff);
+        border:1px solid var(--divider-color, rgba(127,127,127,.4));
+        box-shadow:0 8px 24px rgba(0,0,0,.25);
+        color:var(--primary-text-color, #212121); font-size:12px; line-height:1.8;
+        pointer-events:none; opacity:0; transform:translateY(4px);
+        transition:opacity .12s ease, transform .12s ease; }
       .tooltip.show { opacity:1; transform:translateY(0); }
       .tooltip .dot { width:8px; height:8px; margin-right:5px; }
-      .tip-date { font-weight:700; margin-bottom:2px; color:#fff; }
+      .tip-date { font-weight:700; margin-bottom:2px; }
 
       /* List view */
-      .list-wrap { display:flex; flex-direction:column; gap:6px; max-height:320px; overflow-y:auto;
+      .list-wrap { display:flex; flex-direction:column; gap:6px; max-height:300px; overflow-y:auto;
         padding-right:2px; }
-      .list-row { display:flex; align-items:center; gap:12px; padding:9px 10px;
-        border-radius:11px; background:rgba(255,255,255,.03);
-        border:1px solid rgba(120,170,220,.10); cursor:pointer;
+      .list-row { display:flex; align-items:center; gap:12px; padding:8px 10px;
+        border-radius:11px; background:rgba(127,127,127,.08);
+        border:1px solid var(--divider-color, rgba(127,127,127,.25)); cursor:pointer;
         transition:background .12s ease, border-color .12s ease; }
-      .list-row:hover { background:rgba(60,130,200,.10); }
-      .list-row.active { background:rgba(42,137,255,.12); border-color:rgba(42,137,255,.45); }
-      .list-date { display:flex; flex-direction:column; align-items:center; min-width:38px; }
-      .list-date b { font-size:16px; line-height:1; }
-      .list-date span { font-size:11px; color:#8294a8; }
+      .list-row:hover { background:rgba(127,127,127,.16); }
+      .list-row.active { border-color:var(--primary-color, #1f7ae0); }
+      .list-date { display:flex; flex-direction:column; align-items:center; min-width:36px; }
+      .list-date b { font-size:15px; line-height:1; }
+      .list-date span { font-size:11px; color:var(--secondary-text-color, #727272); }
       .list-mid { flex:1; display:flex; flex-direction:column; gap:5px; }
       .list-bar-row { display:flex; align-items:center; gap:7px; }
       .list-bar-row .dot { width:8px; height:8px; margin:0; flex-shrink:0; }
-      .mini-track { flex:1; height:6px; border-radius:4px; background:rgba(255,255,255,.08); overflow:hidden; }
+      .mini-track { flex:1; height:6px; border-radius:4px;
+        background:rgba(127,127,127,.20); overflow:hidden; }
       .mini-fill { height:100%; border-radius:4px; }
       .mini-fill.solar { background:var(--solar-color); }
       .mini-fill.usage { background:var(--usage-color); }
-      .list-val { font-size:12.5px; min-width:52px; text-align:right; font-variant-numeric:tabular-nums; }
-      .list-unit { font-size:11px; color:#8294a8; }
+      .list-val { font-size:12px; min-width:52px; text-align:right; font-variant-numeric:tabular-nums; }
+      .list-unit { font-size:11px; color:var(--secondary-text-color, #727272); }
 
-      .selected { margin-top:5px; padding-top:10px; border-top:1px solid rgba(180,205,230,.12); }
-      .selected-date { font-size:12px; color:#91a2b6; margin-bottom:5px; }
-      .selected-row { display:flex; justify-content:space-between; align-items:center;
-        min-height:27px; font-size:13px; }
-      .selected-row strong { font-size:14px; }
-
-      .loading, .error, .empty { padding:24px 16px; text-align:center; color:#9aabba; font-size:13px; }
-      .error { color:#ff9b9b; }
+      .loading, .error, .empty { padding:24px 16px; text-align:center;
+        color:var(--secondary-text-color, #727272); font-size:13px; }
+      .error { color:var(--error-color, #db4437); }
 
       @media (max-width: 480px) {
-        .wrap { padding:12px 12px 10px; }
-        .title { font-size:16px; margin-bottom:12px; }
-        .legend { font-size:12px; gap:15px; }
-        .chart-wrap { height:225px; }
-        .tab { font-size:13px; padding:8px 0; }
+        .wrap { padding:10px 10px 8px; }
+        .chart-body { height:140px; }
       }
     `;
+  }
+
+  _fmt(v) {
+    return Number(v || 0).toLocaleString("th-TH", {
+      minimumFractionDigits: this._config.decimals,
+      maximumFractionDigits: this._config.decimals,
+    });
+  }
+
+  // Compact axis tick: drop the decimals when the value is whole.
+  _fmtTick(v) {
+    if (Math.abs(v - Math.round(v)) < 1e-9) {
+      return Number(Math.round(v)).toLocaleString("th-TH");
+    }
+    return this._fmt(v);
+  }
+
+  _dayLabel(dateKey) {
+    const [y, m, d] = dateKey.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    return {
+      day: String(d),
+      month: dt.toLocaleDateString("th-TH", { month: "short" }).replace(".", ""),
+    };
+  }
+
+  _dateFull(dateKey) {
+    const [y, m, d] = dateKey.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    return dt.toLocaleDateString("th-TH", {
+      weekday: "long", day: "numeric", month: "long", year: "numeric",
+    });
   }
 }
 
@@ -702,7 +687,6 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
 
   _update(key, value) {
     const next = { ...this._config, [key]: value };
-    // drop empty optional strings to keep yaml clean, but keep required entities even if empty
     this._config = next;
     this.dispatchEvent(new CustomEvent("config-changed", {
       detail: { config: next },
@@ -719,110 +703,58 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
         .wrap { display:flex; flex-direction:column; gap:12px; padding:4px 2px; }
         .row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
         ha-textfield, ha-entity-picker, ha-select { width:100%; display:block; }
-        .hint { font-size:12px; color:var(--secondary-text-color, #888); margin-top:-8px; }
-        .section { font-weight:600; font-size:13px; margin-top:4px; color:var(--primary-text-color); }
+        .note { font-size:12px; color:var(--secondary-text-color); }
       </style>
       <div class="wrap">
-        <div class="section">Entities</div>
-        <ha-entity-picker id="solar_entity" label="Solar entity (ผลิตไฟ)"></ha-entity-picker>
-        <ha-entity-picker id="usage_entity" label="Usage entity (ใช้ไฟบ้าน)"></ha-entity-picker>
-        <div class="hint">รองรับ sensor ที่เป็น cumulative kWh (มิเตอร์สะสม) เป็นค่าเริ่มต้น</div>
-
-        <div class="section">Display</div>
-        <ha-textfield id="title" label="Title"></ha-textfield>
+        <ha-entity-picker
+          label="Solar entity (พลังงานสะสม)"
+          .hass=${this._hass}
+          .value=${c.solar_entity || ""}
+          @value-changed=${e => this._update("solar_entity", e.detail.value)}
+          allow-custom-entity
+        ></ha-entity-picker>
+        <ha-entity-picker
+          label="Usage entity (พลังงานสะสม)"
+          .hass=${this._hass}
+          .value=${c.usage_entity || ""}
+          @value-changed=${e => this._update("usage_entity", e.detail.value)}
+          allow-custom-entity
+        ></ha-entity-picker>
+        <ha-textfield
+          label="Title"
+          .value=${c.title || ""}
+          @input=${e => this._update("title", e.target.value)}
+        ></ha-textfield>
         <div class="row2">
-          <ha-textfield id="solar_label" label="Solar label"></ha-textfield>
-          <ha-textfield id="usage_label" label="Usage label"></ha-textfield>
+          <ha-textfield label="Solar label" .value=${c.solar_label || ""}
+            @input=${e => this._update("solar_label", e.target.value)}></ha-textfield>
+          <ha-textfield label="Usage label" .value=${c.usage_label || ""}
+            @input=${e => this._update("usage_label", e.target.value)}></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield id="chart_label" label="Chart tab (กราฟ)"></ha-textfield>
-          <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
+          <ha-textfield label="Chart tab label" .value=${c.chart_label || ""}
+            @input=${e => this._update("chart_label", e.target.value)}></ha-textfield>
+          <ha-textfield label="List tab label" .value=${c.list_label || ""}
+            @input=${e => this._update("list_label", e.target.value)}></ha-textfield>
         </div>
         <div class="row2">
-          <ha-textfield id="days" label="Days (3-31)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
-          <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
+          <ha-textfield label="Days" type="number" .value=${c.days ?? 15}
+            @input=${e => this._update("days", Number(e.target.value) || 15)}></ha-textfield>
+          <ha-textfield label="Decimals" type="number" .value=${c.decimals ?? 1}
+            @input=${e => this._update("decimals", Number(e.target.value) || 0)}></ha-textfield>
         </div>
-
-        <div class="section">Data</div>
-        <ha-select id="aggregation" label="Aggregation">
-          <mwc-list-item value="delta">delta — คำนวณรายวันจากมิเตอร์สะสม</mwc-list-item>
-          <mwc-list-item value="daily">daily — entity เป็นค่ารายวันอยู่แล้ว</mwc-list-item>
+        <ha-select label="Aggregation" .value=${c.aggregation || "delta"}
+          @value-changed=${e => this._update("aggregation", e.detail.value)}
+          @closed=${e => e.stopPropagation()}>
+          <mwc-list-item value="delta">delta — คำนวณรายวันจากค่าต่าง (sensor สะสม)</mwc-list-item>
+          <mwc-list-item value="daily">daily — sensor เป็นค่ารายวันอยู่แล้ว</mwc-list-item>
         </ha-select>
-        <div class="hint">ถ้า sensor รีเซ็ตทุกวันให้เลือก daily, ถ้าเป็นมิเตอร์สะสมให้ใช้ delta</div>
+        <div class="note">entity ควรเป็น sensor พลังงานสะสม (kWh) ที่ถูกบันทึกใน recorder หรือมี long-term statistics</div>
       </div>
     `;
-
-    const $ = (id) => this.shadowRoot.querySelector("#" + id);
-
-    // Set values as properties (not attributes) so HA web components pick them up
-    const solarPicker = $("solar_entity");
-    const usagePicker = $("usage_entity");
-    if (solarPicker) {
-      solarPicker.hass = this._hass;
-      solarPicker.value = c.solar_entity || "";
-      solarPicker.setAttribute("label", "Solar entity (ผลิตไฟ)");
-      try { solarPicker.setAttribute("domain-filter", "sensor"); } catch (e) {}
-      solarPicker.allowCustomEntity = true;
-      solarPicker.addEventListener("value-changed", e => this._update("solar_entity", e.detail.value));
-    }
-    if (usagePicker) {
-      usagePicker.hass = this._hass;
-      usagePicker.value = c.usage_entity || "";
-      try { usagePicker.setAttribute("domain-filter", "sensor"); } catch (e) {}
-      usagePicker.allowCustomEntity = true;
-      usagePicker.addEventListener("value-changed", e => this._update("usage_entity", e.detail.value));
-    }
-
-    const setField = (id, val) => {
-      const el = $(id);
-      if (el) el.value = val ?? "";
-    };
-    setField("title", c.title || "");
-    setField("solar_label", c.solar_label || "");
-    setField("usage_label", c.usage_label || "");
-    setField("chart_label", c.chart_label || "");
-    setField("list_label", c.list_label || "");
-    setField("days", c.days ?? 15);
-    setField("decimals", c.decimals ?? 1);
-
-    const onField = (id, key, isNumber) => {
-      const el = $(id);
-      if (!el) return;
-      const handler = (e) => {
-        let v = e.target.value;
-        if (isNumber) {
-          if (v === "" || v === null) { this._update(key, ""); return; }
-          const n = Number(v);
-          this._update(key, Number.isFinite(n) ? n : v);
-          return;
-        }
-        this._update(key, v);
-      };
-      el.addEventListener("input", handler);
-      el.addEventListener("change", handler);
-    };
-    onField("title", "title", false);
-    onField("solar_label", "solar_label", false);
-    onField("usage_label", "usage_label", false);
-    onField("chart_label", "chart_label", false);
-    onField("list_label", "list_label", false);
-    onField("days", "days", true);
-    onField("decimals", "decimals", true);
-
-    const agg = $("aggregation");
-    if (agg) {
-      agg.value = c.aggregation || "delta";
-      agg.addEventListener("value-changed", e => this._update("aggregation", e.detail.value));
-      agg.addEventListener("change", e => {
-        if (e.target.value) this._update("aggregation", e.target.value);
-      });
-      // fallback for older ha-select
-      agg.addEventListener("closed", () => {
-        if (agg.value && agg.value !== (this._config.aggregation || "delta")) {
-          this._update("aggregation", agg.value);
-        }
-      });
-    }
+    this.shadowRoot.querySelectorAll("ha-entity-picker").forEach(p => {
+      if (this._hass) p.hass = this._hass;
+    });
   }
 }
 
@@ -832,6 +764,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Solar vs home usage chart with กราฟ/รายการ tabs, hover/touch tooltip.",
+  description: "Compare daily solar production vs household energy use.",
   preview: true,
 });
