@@ -95,14 +95,40 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._error = null;
     this._render();
     try {
+      const days = Math.max(3, Math.min(31, Number(this._config.days) || 15));
       const now = new Date();
-      const start = new Date(now.getTime() - this._config.history_hours * 3600 * 1000);
+      // +3 days buffer: delta needs the previous day's last reading
+      const start = new Date(now.getTime() - (days + 3) * 24 * 3600 * 1000);
+
       const [solarHistory, usageHistory] = await Promise.all([
-        this._history(this._config.solar_entity, start),
-        this._history(this._config.usage_entity, start),
+        this._fetchHistory(this._config.solar_entity, start),
+        this._fetchHistory(this._config.usage_entity, start),
       ]);
-      const days = this._buildDailyData(solarHistory, usageHistory);
-      this._data = days.slice(-Number(this._config.days));
+
+      // Fallback: long-term statistics. Recorder keeps only ~10 days of raw
+      // history by default (and some entities are excluded from recorder),
+      // but energy sensors almost always have long-term statistics.
+      let solarStat = null;
+      let usageStat = null;
+      if (!solarHistory.length) {
+        solarStat = await this._fetchDailyStatistics(this._config.solar_entity, days).catch(() => null);
+      }
+      if (!usageHistory.length) {
+        usageStat = await this._fetchDailyStatistics(this._config.usage_entity, days).catch(() => null);
+      }
+
+      console.debug("[solar-energy-compare-card] history points:",
+        this._config.solar_entity, solarHistory.length,
+        this._config.usage_entity, usageHistory.length,
+        "| stat days:", solarStat?.size ?? "-", usageStat?.size ?? "-");
+
+      const all = this._buildDailyData(solarHistory, usageHistory, solarStat, usageStat);
+      this._data = all.slice(-days);
+
+      if (!this._data.length) {
+        console.warn("[solar-energy-compare-card] no daily data. Check that the entity_ids exist and are recorded (recorder) or have long-term statistics:",
+          this._config.solar_entity, this._config.usage_entity);
+      }
       if (this._data.length) {
         if (!this._selected || !this._data.some(d => d.date === this._selected)) {
           this._selected = this._data[this._data.length - 1].date;
@@ -117,7 +143,7 @@ class SolarEnergyCompareCard extends HTMLElement {
     }
   }
 
-  _history(entityId, start) {
+  _fetchHistory(entityId, start) {
     return this._hass.callWS({
       type: "history/history_during_period",
       start_time: start.toISOString(),
@@ -126,51 +152,181 @@ class SolarEnergyCompareCard extends HTMLElement {
       minimal_response: false,
       no_attributes: true,
       significant_changes_only: false,
-    }).then(result => result?.[entityId] || []);
+    }).then(result => {
+      if (!result) return [];
+      if (Array.isArray(result)) {
+        const found = result.find(r => r && r.entity_id === entityId);
+        return (found && (found.states || found.data)) || [];
+      }
+      return result[entityId] || [];
+    }).catch(err => {
+      console.warn("[solar-energy-compare-card] history failed for", entityId, err?.message || err);
+      return [];
+    });
   }
 
-  _buildDailyData(solar, usage) {
-    const sN = this._normaliseHistory(solar);
-    const uN = this._normaliseHistory(usage);
-    const dates = new Set([...sN.map(x => x.date), ...uN.map(x => x.date)]);
-    const sortedDates = [...dates].sort();
-    return sortedDates.map(date => ({
+  // Long-term statistics fallback -> Map("YYYY-MM-DD" -> kWh used that day).
+  // Prefers per-day `change` (already a daily delta); otherwise diffs the
+  // cumulative `sum`/`state` of consecutive days.
+  async _fetchDailyStatistics(entityId, days) {
+    const end = new Date();
+    const start = new Date(end.getTime() - (days + 2) * 24 * 3600 * 1000);
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const toMs = (t) => {
+      if (t == null) return NaN;
+      if (typeof t === "number") return t < 1e12 ? t * 1000 : t;
+      return Date.parse(t);
+    };
+    const callStats = (types) => this._hass.callWS({
+      type: "recorder/statistics_during_period",
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+      period: "day",
+      statistic_ids: [entityId],
+      ...(types ? { statistic_types: types } : {}),
+    });
+
+    let result;
+    try {
+      result = await callStats(["change", "sum", "state"]);
+    } catch (e) {
+      result = await callStats(null); // older HA without "change" type
+    }
+
+    const rows = (result?.[entityId] || [])
+      .map(r => ({
+        ms: toMs(r.start),
+        change: num(r.change),
+        sum: num(r.sum),
+        state: num(r.state),
+      }))
+      .filter(r => Number.isFinite(r.ms))
+      .sort((a, b) => a.ms - b.ms);
+
+    const map = new Map();
+    let prevSum = null;
+    let prevState = null;
+    for (const r of rows) {
+      const key = this._localDateKey(new Date(r.ms));
+      let daily = null;
+      if (r.change != null) {
+        daily = Math.max(0, r.change);
+      } else if (r.sum != null && prevSum != null) {
+        daily = r.sum - prevSum;
+        if (daily < 0) daily = Math.max(0, r.sum); // counter reset
+      } else if (r.state != null && prevState != null) {
+        daily = r.state - prevState;
+        if (daily < 0) daily = Math.max(0, r.state);
+      }
+      if (daily != null && Number.isFinite(daily)) map.set(key, Math.max(0, daily));
+      if (r.sum != null) prevSum = r.sum;
+      if (r.state != null) prevState = r.state;
+    }
+    return map;
+  }
+
+  _buildDailyData(solarPts, usagePts, solarStat, usageStat) {
+    if (this._config.aggregation === "daily") {
+      return this._buildDailyLastValue(solarPts, usagePts);
+    }
+    return this._buildDeltaDaily(solarPts, usagePts, solarStat, usageStat);
+  }
+
+  // delta mode: daily = last reading of the day − last reading of the
+  // previous day. Works with sparse history (even 1 reading/day).
+  // Entities with no recorder history fall back to long-term statistics.
+  _buildDeltaDaily(solarPts, usagePts, solarStat, usageStat) {
+    const perEntity = (pts) => {
+      const norm = this._normaliseHistory(pts);
+      const lastByDate = new Map();
+      for (const p of norm) lastByDate.set(p.date, p.value);
+      const dates = [...lastByDate.keys()].sort();
+      const out = new Map();
+      let prev = null;
+      for (const d of dates) {
+        const cur = lastByDate.get(d);
+        if (prev != null && cur != null) {
+          let delta = cur - prev;
+          if (delta < 0) {
+            // counter reset across the gap: use within-day positive movement
+            delta = this._withinDayGain(norm, d);
+            if (!(delta > 0)) delta = Math.max(0, cur);
+          }
+          out.set(d, Math.max(0, delta));
+        }
+        if (cur != null) prev = cur;
+      }
+      return out;
+    };
+
+    const sD = perEntity(solarPts);
+    const uD = perEntity(usagePts);
+
+    const useStatS = sD.size === 0 && solarStat && solarStat.size > 0;
+    const useStatU = uD.size === 0 && usageStat && usageStat.size > 0;
+
+    const dates = new Set([
+      ...sD.keys(),
+      ...uD.keys(),
+      ...(useStatS ? solarStat.keys() : []),
+      ...(useStatU ? usageStat.keys() : []),
+    ]);
+    return [...dates].sort().map(date => ({
       date,
-      solar: this._safe(this._dailyValue(sN, date)),
-      usage: this._safe(this._dailyValue(uN, date)),
+      solar: this._safe(useStatS ? (solarStat.get(date) ?? 0) : (sD.get(date) ?? 0)),
+      usage: this._safe(useStatU ? (usageStat.get(date) ?? 0) : (uD.get(date) ?? 0)),
     }));
+  }
+
+  _buildDailyLastValue(solarPts, usagePts) {
+    const lastByDate = (pts) => {
+      const m = new Map();
+      for (const p of this._normaliseHistory(pts)) m.set(p.date, p.value);
+      return m;
+    };
+    const sM = lastByDate(solarPts);
+    const uM = lastByDate(usagePts);
+    const dates = new Set([...sM.keys(), ...uM.keys()]);
+    return [...dates].sort().map(date => ({
+      date,
+      solar: this._safe(sM.get(date) ?? 0),
+      usage: this._safe(uM.get(date) ?? 0),
+    }));
+  }
+
+  _withinDayGain(norm, date) {
+    let gain = 0;
+    let prev = null;
+    for (const p of norm) {
+      if (p.date !== date) continue;
+      if (prev != null && p.value > prev) gain += p.value - prev;
+      prev = p.value;
+    }
+    return gain;
   }
 
   _normaliseHistory(history) {
     return (history || [])
       .map(item => {
-        const value = Number.parseFloat(item.state);
-        const dt = new Date(item.last_changed || item.last_updated);
-        return { value, dt, date: this._localDateKey(dt) };
+        const value = Number.parseFloat(item.state ?? item.s);
+        let ms = Date.parse(item.last_changed || item.last_updated || "");
+        if (!Number.isFinite(ms)) {
+          const lc = item.lc ?? item.lu;
+          const n = Number(lc);
+          if (Number.isFinite(n)) ms = n < 1e12 ? n * 1000 : n;
+        }
+        const dt = new Date(ms);
+        return {
+          value,
+          dt,
+          date: Number.isFinite(ms) ? this._localDateKey(dt) : null,
+        };
       })
-      .filter(x => Number.isFinite(x.value) && !Number.isNaN(x.dt.getTime()))
+      .filter(x => Number.isFinite(x.value) && x.date)
       .sort((a, b) => a.dt - b.dt);
-  }
-
-  _dailyValue(history, date) {
-    const items = history.filter(x => x.date === date);
-    if (!items.length) return 0;
-    if (this._config.aggregation === "daily") {
-      return items[items.length - 1].value;
-    }
-    let total = 0;
-    let previous = null;
-    for (const item of items) {
-      if (previous !== null) {
-        const diff = item.value - previous;
-        if (diff >= 0) total += diff;
-      }
-      previous = item.value;
-    }
-    if (total > 0) return total;
-    const first = items[0].value;
-    const last = items[items.length - 1].value;
-    return Math.max(0, last - first);
   }
 
   _localDateKey(date) {
@@ -280,7 +436,7 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   _listHtml(data) {
-    if (!data.length) return `<div class="empty">ยังไม่มีข้อมูลย้อนหลัง</div>`;
+    if (!data.length) return `<div class="empty">ยังไม่มีข้อมูลย้อนหลัง<br><small>ตรวจสอบว่า entity_id ถูกต้อง และ sensor ถูกบันทึกใน recorder หรือมี long-term statistics<br>ดูรายละเอียดใน browser console (F12)</small></div>`;
     const rows = [...data].reverse(); // newest first
     const max = Math.max(1, ...data.flatMap(d => [d.solar, d.usage]));
     return rows.map(d => {
@@ -311,7 +467,7 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   _chartSvg(data, max) {
-    if (!data.length) return `<div class="empty">ยังไม่มีข้อมูลย้อนหลัง</div>`;
+    if (!data.length) return `<div class="empty">ยังไม่มีข้อมูลย้อนหลัง<br><small>ตรวจสอบว่า entity_id ถูกต้อง และ sensor ถูกบันทึกใน recorder หรือมี long-term statistics<br>ดูรายละเอียดใน browser console (F12)</small></div>`;
     const W = 700, H = 245;
     const padL = 35, padR = 8, padT = 10, padB = 42;
     const chartW = W - padL - padR;
