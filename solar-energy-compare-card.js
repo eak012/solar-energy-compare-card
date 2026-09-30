@@ -1,8 +1,7 @@
-/* solar-energy-compare-card.js v6
+/* solar-energy-compare-card.js v4
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
- * v6: legend shows today's values; adds solar/usage ratio bar.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -16,16 +15,10 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._error = null;
     this._selected = null;
     this._view = "chart"; // 'chart' | 'list'
-    this._configTimer = null;
-    this._refreshTimer = null;
-    this._lastFetch = 0;
+    this._timer = null;
   }
 
   setConfig(config) {
-    // Capture previous entities BEFORE overwriting so entity changes
-    // in the visual editor are detected and trigger a reload.
-    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
-    const wasMissing = this._configMissing;
     this._config = {
       days: 15,
       title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
@@ -41,14 +34,16 @@ class SolarEnergyCompareCard extends HTMLElement {
     };
     // Don't throw for missing entities — show a friendly placeholder instead.
     // This keeps getStubConfig("") working and the visual editor usable.
+    const wasMissing = this._configMissing;
+    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
     this._configMissing = !config?.solar_entity || !config?.usage_entity;
     const newEntities = `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`;
     // Fetch history when entities become valid or change
     if (!this._configMissing && this._hass) {
       if (wasMissing || !this._loadedOnce || prevEntities !== newEntities) {
         this._loadedOnce = true;
-        clearTimeout(this._configTimer);
-        this._configTimer = setTimeout(() => this._loadHistory(), 300);
+        clearTimeout(this._timer);
+        this._timer = setTimeout(() => this._loadHistory(), 300);
       }
     }
     this._render();
@@ -64,17 +59,11 @@ class SolarEnergyCompareCard extends HTMLElement {
       const s = hass.states?.[this._config.solar_entity];
       const u = hass.states?.[this._config.usage_entity];
       const key = `${s?.state}|${u?.state}`;
-      if (key === this._lastStateKey) return;
-      this._lastStateKey = key;
-      // Throttle background refresh: at most once every 5 minutes so the
-      // chart never blinks while data is being refreshed.
-      if (this._refreshTimer) return;
-      const elapsed = Date.now() - (this._lastFetch || 0);
-      const delay = elapsed >= 5 * 60 * 1000 ? 2000 : 5 * 60 * 1000 - elapsed;
-      this._refreshTimer = setTimeout(() => {
-        this._refreshTimer = null;
-        this._loadHistory();
-      }, delay);
+      if (key !== this._lastStateKey) {
+        this._lastStateKey = key;
+        clearTimeout(this._timer);
+        this._timer = setTimeout(() => this._loadHistory(), 1500);
+      }
     }
   }
 
@@ -102,13 +91,9 @@ class SolarEnergyCompareCard extends HTMLElement {
 
   async _loadHistory() {
     if (!this._hass || this._loading || this._configMissing) return;
-    // Only show the loading skeleton on the very first load. Background
-    // refreshes keep the existing chart visible so nothing blinks.
-    const firstLoad = this._data.length === 0;
     this._loading = true;
     this._error = null;
-    this._lastFetch = Date.now();
-    if (firstLoad) this._render();
+    this._render();
     try {
       const days = Math.max(3, Math.min(31, Number(this._config.days) || 15));
       const now = new Date();
@@ -360,14 +345,6 @@ class SolarEnergyCompareCard extends HTMLElement {
     });
   }
 
-  // Compact axis tick: drop the decimals when the value is whole.
-  _fmtTick(v) {
-    if (Math.abs(v - Math.round(v)) < 1e-9) {
-      return Number(Math.round(v)).toLocaleString("th-TH");
-    }
-    return this._fmt(v);
-  }
-
   _dayLabel(dateKey) {
     const [y, m, d] = dateKey.split("-").map(Number);
     const dt = new Date(y, m - 1, d);
@@ -410,8 +387,8 @@ class SolarEnergyCompareCard extends HTMLElement {
 
     const data = this._data || [];
     const max = Math.max(1, ...data.flatMap(d => [d.solar, d.usage]));
+    const selected = data.find(d => d.date === this._selected) || data[data.length - 1];
     const isChart = this._view === "chart";
-    const yTicks = [0, 1, 2, 3, 4].map(i => max * i / 4);
 
     this.shadowRoot.innerHTML = `
       ${style}
@@ -424,26 +401,29 @@ class SolarEnergyCompareCard extends HTMLElement {
 
           <div class="title">${this._esc(this._config.title)}</div>
 
-          ${this._summaryHtml(data)}
+          <div class="legend">
+            <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} (kWh)</span>
+            <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} (kWh)</span>
+          </div>
 
           ${isChart ? `
-            <div class="chart-wrap">
-              <div class="chart-body">
-                <div class="y-axis">
-                  ${yTicks.map((v, i) => `<span style="bottom:${i * 25}%">${this._fmtTick(v)}</span>`).join("")}
-                </div>
-                <div class="plot" id="plot">
-                  ${this._chartSvg(data, max)}
-                  <div class="tooltip" id="tooltip"></div>
-                </div>
-              </div>
-              <div class="x-axis">
-                ${data.map(d => {
-                  const l = this._dayLabel(d.date);
-                  return `<div class="x-col"><b>${l.day}</b><span>${this._esc(l.month)}</span></div>`;
-                }).join("")}
-              </div>
+            <div class="chart-wrap" id="chart">
+              ${this._chartSvg(data, max)}
+              <div class="tooltip" id="tooltip"></div>
             </div>
+            ${selected ? `
+              <div class="selected">
+                <div class="selected-date">${this._dateFull(selected.date)}</div>
+                <div class="selected-row">
+                  <span><i class="dot solar"></i>${this._esc(this._config.solar_label)}</span>
+                  <strong>${this._fmt(selected.solar)} kWh</strong>
+                </div>
+                <div class="selected-row">
+                  <span><i class="dot usage"></i>${this._esc(this._config.usage_label)}</span>
+                  <strong>${this._fmt(selected.usage)} kWh</strong>
+                </div>
+              </div>
+            ` : ""}
           ` : `
             <div class="list-wrap" id="list">
               ${this._listHtml(data)}
@@ -453,37 +433,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       </ha-card>
     `;
     this._bindEvents();
-  }
-
-  // Summary header: today's values per entity + a left/right ratio bar
-  // showing the solar vs usage share over the displayed period.
-  _summaryHtml(data) {
-    const today = data && data.length ? data[data.length - 1] : null;
-    const todaySolar = today ? this._fmt(today.solar) : "–";
-    const todayUsage = today ? this._fmt(today.usage) : "–";
-
-    const totalSolar = (data || []).reduce((a, d) => a + d.solar, 0);
-    const totalUsage = (data || []).reduce((a, d) => a + d.usage, 0);
-    const grand = totalSolar + totalUsage;
-    const solarPct = grand > 0 ? (totalSolar / grand) * 100 : 0;
-    const usagePct = grand > 0 ? 100 - solarPct : 0;
-
-    return `
-      <div class="legend">
-        <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b class="legend-val">${todaySolar} kWh</b></span>
-        <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b class="legend-val">${todayUsage} kWh</b></span>
-      </div>
-      <div class="ratio" title="สัดส่วนรวม ${this._esc(this._config.solar_label)} ${this._fmt(totalSolar)} kWh / ${this._esc(this._config.usage_label)} ${this._fmt(totalUsage)} kWh">
-        <div class="ratio-bar">
-          <div class="ratio-fill solar" style="width:${solarPct.toFixed(1)}%"></div>
-          <div class="ratio-fill usage" style="width:${usagePct.toFixed(1)}%"></div>
-        </div>
-        <div class="ratio-labels">
-          <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b>${solarPct.toFixed(1)}%</b></span>
-          <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b>${usagePct.toFixed(1)}%</b></span>
-        </div>
-      </div>
-    `;
   }
 
   _listHtml(data) {
@@ -519,35 +468,46 @@ class SolarEnergyCompareCard extends HTMLElement {
 
   _chartSvg(data, max) {
     if (!data.length) return `<div class="empty">ยังไม่มีข้อมูลย้อนหลัง<br><small>ตรวจสอบว่า entity_id ถูกต้อง และ sensor ถูกบันทึกใน recorder หรือมี long-term statistics<br>ดูรายละเอียดใน browser console (F12)</small></div>`;
-    // No text inside the SVG: axis labels are HTML so the browser renders
-    // them in the system font without non-uniform stretching.
-    const W = 700, H = 200;
-    const groupW = W / data.length;
+    const W = 700, H = 245;
+    const padL = 35, padR = 8, padT = 10, padB = 42;
+    const chartW = W - padL - padR;
+    const chartH = H - padT - padB;
+    const groupW = chartW / data.length;
     const gap = Math.min(5, groupW * 0.10);
     const barW = Math.max(3, (groupW - gap * 3) / 2);
+    const baseY = padT + chartH;
 
     let svg = `
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="chart-svg"
            role="img" aria-label="กราฟเปรียบเทียบการผลิตไฟและการใช้ไฟย้อนหลัง">
+        <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${baseY}" class="axis"/>
+        <line x1="${padL}" y1="${baseY}" x2="${W-padR}" y2="${baseY}" class="axis"/>
     `;
     for (let i = 0; i <= 4; i++) {
-      const y = H - H * (i / 4);
-      svg += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" class="grid"/>`;
+      const value = max * (i / 4);
+      const y = baseY - chartH * (i / 4);
+      svg += `
+        <line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" class="grid"/>
+        <text x="${padL - 7}" y="${y + 4}" text-anchor="end" class="y-label">${this._fmt(value).replace(/,0$/, "")}</text>
+      `;
     }
     data.forEach((d, i) => {
-      const center = groupW * i + groupW / 2;
-      const solarH = H * (d.solar / max);
-      const usageH = H * (d.usage / max);
+      const center = padL + groupW * i + groupW / 2;
+      const solarH = chartH * (d.solar / max);
+      const usageH = chartH * (d.usage / max);
       const solarX = center - barW - gap / 2;
       const usageX = center + gap / 2;
-      const solarY = H - solarH;
-      const usageY = H - usageH;
+      const solarY = baseY - solarH;
+      const usageY = baseY - usageH;
       const active = d.date === this._selected ? " active" : "";
+      const label = this._dayLabel(d.date);
       svg += `
         <g class="day-group${active}" data-date="${d.date}">
-          <rect class="hit" x="${groupW*i}" y="0" width="${groupW}" height="${H}" rx="4"/>
-          <rect class="bar solar-bar" x="${solarX.toFixed(1)}" y="${solarY.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1.5, solarH).toFixed(1)}" rx="2"/>
-          <rect class="bar usage-bar" x="${usageX.toFixed(1)}" y="${usageY.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1.5, usageH).toFixed(1)}" rx="2"/>
+          <rect class="hit" x="${padL + groupW*i}" y="${padT}" width="${groupW}" height="${chartH + padB}" rx="4"/>
+          <rect class="bar solar-bar" x="${solarX}" y="${solarY}" width="${barW}" height="${Math.max(1, solarH)}" rx="2"/>
+          <rect class="bar usage-bar" x="${usageX}" y="${usageY}" width="${barW}" height="${Math.max(1, usageH)}" rx="2"/>
+          <text x="${center}" y="${baseY + 17}" text-anchor="middle" class="x-day">${label.day}</text>
+          <text x="${center}" y="${baseY + 31}" text-anchor="middle" class="x-month">${label.month}</text>
         </g>
       `;
     });
@@ -570,32 +530,33 @@ class SolarEnergyCompareCard extends HTMLElement {
       return;
     }
 
-    const plot = this.shadowRoot.querySelector("#plot");
+    const chart = this.shadowRoot.querySelector("#chart");
     const tooltip = this.shadowRoot.querySelector("#tooltip");
-    if (!plot || !tooltip) return;
+    if (!chart || !tooltip) return;
 
-    // Hover shows a popup tooltip only — no full re-render, so the chart
-    // never blinks while hovering.
     const show = (date, event) => {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
       this._selected = date;
-      this.shadowRoot.querySelectorAll(".day-group").forEach(g =>
-        g.classList.toggle("active", g.dataset.date === date));
-      const rect = plot.getBoundingClientRect();
+      // re-render to update highlight + selected panel, then show tooltip
+      this._render();
+      const newChart = this.shadowRoot.querySelector("#chart");
+      const newTooltip = this.shadowRoot.querySelector("#tooltip");
+      if (!newChart || !newTooltip) return;
+      const rect = newChart.getBoundingClientRect();
       const x = (event?.clientX ?? rect.left + rect.width / 2) - rect.left;
       const y = (event?.clientY ?? rect.top + 20) - rect.top;
-      tooltip.innerHTML = `
+      newTooltip.innerHTML = `
         <div class="tip-date">${this._dateFull(d.date)}</div>
-        <div><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b>${this._fmt(d.solar)} kWh</b></div>
-        <div><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b>${this._fmt(d.usage)} kWh</b></div>
+        <div><i class="dot solar"></i>โซลาร์เซลล์ <b>${this._fmt(d.solar)} kWh</b></div>
+        <div><i class="dot usage"></i>ใช้ไฟ <b>${this._fmt(d.usage)} kWh</b></div>
       `;
-      tooltip.classList.add("show");
+      newTooltip.classList.add("show");
       const tw = 170;
       let left = x - tw / 2;
       left = Math.max(4, Math.min(rect.width - tw - 4, left));
-      tooltip.style.left = `${left}px`;
-      tooltip.style.top = `${Math.max(4, y - 78)}px`;
+      newTooltip.style.left = `${left}px`;
+      newTooltip.style.top = `${Math.max(4, y - 78)}px`;
     };
 
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
@@ -603,13 +564,14 @@ class SolarEnergyCompareCard extends HTMLElement {
       group.addEventListener("pointermove", e => {
         const tt = this.shadowRoot.querySelector("#tooltip");
         if (!tt?.classList.contains("show")) return;
-        const rect = plot.getBoundingClientRect();
+        const rect = chart.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const tw = 170;
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
       });
       group.addEventListener("pointerleave", () => {
-        tooltip.classList.remove("show");
+        const tt = this.shadowRoot.querySelector("#tooltip");
+        if (tt) tt.classList.remove("show");
       });
       group.addEventListener("click", e => show(group.dataset.date, e));
       group.addEventListener("touchstart", e => {
@@ -627,115 +589,89 @@ class SolarEnergyCompareCard extends HTMLElement {
 
   _css() {
     return `
-      :host { display:block; --solar-color:#ffbd32; --usage-color:#2389ff; }
-      /* No background override: the card uses the app/theme background.
-         Text colors follow Home Assistant theme variables. */
-      ha-card { overflow:hidden; border-radius:16px;
-        color:var(--primary-text-color, #212121); }
-      .wrap { padding:12px 12px 10px; position:relative; }
+      :host { display:block; --solar-color:#ffbd32; --usage-color:#2389ff;
+        --card-bg:#071d31; --text:#f5f7fb; --muted:#91a2b6; }
+      ha-card { overflow:hidden; border-radius:16px; background:var(--card-bg);
+        color:var(--text); border:1px solid rgba(72,150,220,.30); box-shadow:none; }
+      .wrap { padding:14px 14px 13px; position:relative; }
 
-      /* Tabs */
-      .tabs { display:flex; background:rgba(127,127,127,.18); border-radius:12px;
-        padding:4px; margin-bottom:10px; gap:4px; }
-      .tab { flex:1; border:0; border-radius:9px; padding:7px 0; font-size:13px;
-        font-weight:600; background:transparent;
-        color:var(--secondary-text-color, #727272); cursor:pointer;
+      /* Tabs - match mock */
+      .tabs { display:flex; background:rgba(20,45,70,.85); border-radius:12px;
+        padding:4px; margin-bottom:14px; gap:4px; }
+      .tab { flex:1; border:0; border-radius:9px; padding:9px 0; font-size:14px;
+        font-weight:600; background:transparent; color:#8ea3b8; cursor:pointer;
         transition:background .15s ease, color .15s ease; }
-      .tab.active { background:var(--primary-color, #1f7ae0);
-        color:var(--text-primary-color, #fff);
-        box-shadow:0 2px 8px rgba(0,0,0,.25); }
+      .tab.active { background:#1f7ae0; color:#fff; box-shadow:0 2px 8px rgba(31,122,224,.45); }
+      .tab:not(.active):hover { color:#c9d8e8; }
 
-      .title { font-size:15px; line-height:1.25; font-weight:700; margin:0 0 8px; }
-      .legend { display:flex; gap:18px; align-items:center; flex-wrap:wrap;
-        font-size:12px; margin-bottom:6px;
-        color:var(--secondary-text-color, #727272); }
-      .legend-val { color:var(--primary-text-color, #212121);
-        font-variant-numeric:tabular-nums; }
-      .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
-        margin-right:7px; vertical-align:-1px; }
+      .title { font-size:17px; line-height:1.25; font-weight:700; margin:0 0 14px; }
+      .legend { display:flex; gap:22px; align-items:center; flex-wrap:wrap;
+        color:#dbe6f2; font-size:13px; margin-bottom:8px; }
+      .dot { display:inline-block; width:11px; height:11px; border-radius:50%;
+        margin-right:8px; vertical-align:-1px; }
       .dot.solar { background:var(--solar-color); }
       .dot.usage { background:var(--usage-color); }
 
-      /* Ratio bar: left/right share of solar vs usage over the shown period */
-      .ratio { margin:0 0 8px; }
-      .ratio-bar { display:flex; height:12px; border-radius:8px; overflow:hidden;
-        background:rgba(127,127,127,.20); margin-bottom:6px; }
-      .ratio-fill { height:100%; transition:width .3s ease; }
-      .ratio-fill.solar { background:var(--solar-color); }
-      .ratio-fill.usage { background:var(--usage-color); }
-      .ratio-labels { display:flex; justify-content:space-between; align-items:center;
-        font-size:12px; color:var(--secondary-text-color, #727272); }
-      .ratio-labels b { color:var(--primary-text-color, #212121);
-        font-variant-numeric:tabular-nums; }
-
-      /* Chart: bars+gridlines are SVG, axis labels are plain HTML so the
-         browser renders them in the system font with no distortion. */
-      .chart-wrap { width:100%; touch-action:pan-y; }
-      .chart-body { display:flex; height:160px; }
-      .y-axis { position:relative; width:36px; flex-shrink:0; }
-      .y-axis span { position:absolute; right:6px; transform:translateY(50%);
-        font-size:11px; line-height:1; white-space:nowrap;
-        color:var(--secondary-text-color, #727272);
-        font-variant-numeric:tabular-nums; }
-      .plot { flex:1; position:relative; min-width:0; }
-      .chart-svg { display:block; width:100%; height:100%; }
-      .grid { stroke:var(--divider-color, rgba(127,127,127,.35)); stroke-width:1; }
-      .bar { }
+      .chart-wrap { position:relative; width:100%; height:245px; touch-action:pan-y; }
+      .chart-svg { display:block; width:100%; height:100%; overflow:visible; }
+      .grid { stroke:rgba(185,207,230,.13); stroke-width:1; vector-effect:non-scaling-stroke; }
+      .axis { stroke:rgba(185,207,230,.20); stroke-width:1; vector-effect:non-scaling-stroke; }
+      .y-label { fill:#9aabba; font-size:11px; }
+      .x-day { fill:#e1e9f2; font-size:11px; font-weight:500; }
+      .x-month { fill:#8294a8; font-size:10px; }
+      .bar { vector-effect:non-scaling-stroke; }
       .solar-bar { fill:var(--solar-color); }
       .usage-bar { fill:var(--usage-color); }
       .hit { fill:transparent; cursor:pointer; }
       .day-group.active .hit { fill:rgba(42,137,255,.10); stroke:rgba(42,137,255,.50); stroke-width:1; }
-      .day-group.active .solar-bar, .day-group.active .usage-bar { filter:brightness(1.08); }
-      .x-axis { display:flex; margin-left:36px; margin-top:5px; }
-      .x-col { flex:1; min-width:0; text-align:center; }
-      .x-col b { display:block; font-size:11px; font-weight:500; line-height:1.3;
-        font-variant-numeric:tabular-nums; }
-      .x-col span { display:block; font-size:10px; line-height:1.3;
-        color:var(--secondary-text-color, #727272); white-space:nowrap;
-        overflow:hidden; text-overflow:ellipsis; }
+      .day-group.active .solar-bar, .day-group.active .usage-bar { filter:brightness(1.12); }
 
       .tooltip { position:absolute; z-index:10; width:170px; box-sizing:border-box;
-        padding:9px 11px; border-radius:11px;
-        background:var(--card-background-color, #fff);
-        border:1px solid var(--divider-color, rgba(127,127,127,.4));
-        box-shadow:0 8px 24px rgba(0,0,0,.25);
-        color:var(--primary-text-color, #212121); font-size:12px; line-height:1.8;
-        pointer-events:none; opacity:0; transform:translateY(4px);
-        transition:opacity .12s ease, transform .12s ease; }
+        padding:10px 11px; border-radius:11px; background:rgba(8,25,42,.97);
+        border:1px solid rgba(100,170,235,.38); box-shadow:0 8px 24px rgba(0,0,0,.35);
+        color:#f4f7fb; font-size:12px; line-height:1.8; pointer-events:none;
+        opacity:0; transform:translateY(4px); transition:opacity .12s ease, transform .12s ease; }
       .tooltip.show { opacity:1; transform:translateY(0); }
       .tooltip .dot { width:8px; height:8px; margin-right:5px; }
-      .tip-date { font-weight:700; margin-bottom:2px; }
+      .tip-date { font-weight:700; margin-bottom:2px; color:#fff; }
 
       /* List view */
-      .list-wrap { display:flex; flex-direction:column; gap:6px; max-height:300px; overflow-y:auto;
+      .list-wrap { display:flex; flex-direction:column; gap:6px; max-height:320px; overflow-y:auto;
         padding-right:2px; }
-      .list-row { display:flex; align-items:center; gap:12px; padding:8px 10px;
-        border-radius:11px; background:rgba(127,127,127,.08);
-        border:1px solid var(--divider-color, rgba(127,127,127,.25)); cursor:pointer;
+      .list-row { display:flex; align-items:center; gap:12px; padding:9px 10px;
+        border-radius:11px; background:rgba(255,255,255,.03);
+        border:1px solid rgba(120,170,220,.10); cursor:pointer;
         transition:background .12s ease, border-color .12s ease; }
-      .list-row:hover { background:rgba(127,127,127,.16); }
-      .list-row.active { border-color:var(--primary-color, #1f7ae0); }
-      .list-date { display:flex; flex-direction:column; align-items:center; min-width:36px; }
-      .list-date b { font-size:15px; line-height:1; }
-      .list-date span { font-size:11px; color:var(--secondary-text-color, #727272); }
+      .list-row:hover { background:rgba(60,130,200,.10); }
+      .list-row.active { background:rgba(42,137,255,.12); border-color:rgba(42,137,255,.45); }
+      .list-date { display:flex; flex-direction:column; align-items:center; min-width:38px; }
+      .list-date b { font-size:16px; line-height:1; }
+      .list-date span { font-size:11px; color:#8294a8; }
       .list-mid { flex:1; display:flex; flex-direction:column; gap:5px; }
       .list-bar-row { display:flex; align-items:center; gap:7px; }
       .list-bar-row .dot { width:8px; height:8px; margin:0; flex-shrink:0; }
-      .mini-track { flex:1; height:6px; border-radius:4px;
-        background:rgba(127,127,127,.20); overflow:hidden; }
+      .mini-track { flex:1; height:6px; border-radius:4px; background:rgba(255,255,255,.08); overflow:hidden; }
       .mini-fill { height:100%; border-radius:4px; }
       .mini-fill.solar { background:var(--solar-color); }
       .mini-fill.usage { background:var(--usage-color); }
-      .list-val { font-size:12px; min-width:52px; text-align:right; font-variant-numeric:tabular-nums; }
-      .list-unit { font-size:11px; color:var(--secondary-text-color, #727272); }
+      .list-val { font-size:12.5px; min-width:52px; text-align:right; font-variant-numeric:tabular-nums; }
+      .list-unit { font-size:11px; color:#8294a8; }
 
-      .loading, .error, .empty { padding:24px 16px; text-align:center;
-        color:var(--secondary-text-color, #727272); font-size:13px; }
-      .error { color:var(--error-color, #db4437); }
+      .selected { margin-top:5px; padding-top:10px; border-top:1px solid rgba(180,205,230,.12); }
+      .selected-date { font-size:12px; color:#91a2b6; margin-bottom:5px; }
+      .selected-row { display:flex; justify-content:space-between; align-items:center;
+        min-height:27px; font-size:13px; }
+      .selected-row strong { font-size:14px; }
+
+      .loading, .error, .empty { padding:24px 16px; text-align:center; color:#9aabba; font-size:13px; }
+      .error { color:#ff9b9b; }
 
       @media (max-width: 480px) {
-        .wrap { padding:10px 10px 8px; }
-        .chart-body { height:140px; }
+        .wrap { padding:12px 12px 10px; }
+        .title { font-size:16px; margin-bottom:12px; }
+        .legend { font-size:12px; gap:15px; }
+        .chart-wrap { height:225px; }
+        .tab { font-size:13px; padding:8px 0; }
       }
     `;
   }
