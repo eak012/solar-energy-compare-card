@@ -1,8 +1,9 @@
-/* solar-energy-compare-card.js v6
+/* solar-energy-compare-card.js v7
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
  * v6: legend shows today's values; adds solar/usage ratio bar.
+ * v7: replaces ratio bar with daily diff + self-sufficiency stat boxes.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -33,6 +34,8 @@ class SolarEnergyCompareCard extends HTMLElement {
       usage_label: "ใช้ไฟ",
       chart_label: "กราฟ",
       list_label: "รายการ",
+      diff_label: "ส่วนต่างวันนี้",
+      self_label: "พึ่งพาตัวเอง",
       unit: "kWh",
       decimals: 1,
       history_hours: 24 * 17,
@@ -95,6 +98,8 @@ class SolarEnergyCompareCard extends HTMLElement {
       usage_label: "ใช้ไฟ",
       chart_label: "กราฟ",
       list_label: "รายการ",
+      diff_label: "ส่วนต่างวันนี้",
+      self_label: "พึ่งพาตัวเอง",
       decimals: 1,
       aggregation: "delta",
     };
@@ -455,32 +460,32 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._bindEvents();
   }
 
-  // Summary header: today's values per entity + a left/right ratio bar
-  // showing the solar vs usage share over the displayed period.
+  // Summary header: today's values per entity + stat boxes for
+  // today's net difference and self-sufficiency.
   _summaryHtml(data) {
     const today = data && data.length ? data[data.length - 1] : null;
-    const todaySolar = today ? this._fmt(today.solar) : "–";
-    const todayUsage = today ? this._fmt(today.usage) : "–";
+    const todaySolar = today ? today.solar : 0;
+    const todayUsage = today ? today.usage : 0;
 
-    const totalSolar = (data || []).reduce((a, d) => a + d.solar, 0);
-    const totalUsage = (data || []).reduce((a, d) => a + d.usage, 0);
-    const grand = totalSolar + totalUsage;
-    const solarPct = grand > 0 ? (totalSolar / grand) * 100 : 0;
-    const usagePct = grand > 0 ? 100 - solarPct : 0;
+    const diff = todaySolar - todayUsage;
+    const diffText = (diff >= 0 ? "+" : "−") + this._fmt(Math.abs(diff)) + " kWh";
+    const selfPct = todayUsage > 0
+      ? (Math.min(todaySolar, todayUsage) / todayUsage) * 100
+      : 0;
 
     return `
       <div class="legend">
-        <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b class="legend-val">${todaySolar} kWh</b></span>
-        <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b class="legend-val">${todayUsage} kWh</b></span>
+        <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b class="legend-val">${today ? this._fmt(todaySolar) : "–"} kWh</b></span>
+        <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b class="legend-val">${today ? this._fmt(todayUsage) : "–"} kWh</b></span>
       </div>
-      <div class="ratio" title="สัดส่วนรวม ${this._esc(this._config.solar_label)} ${this._fmt(totalSolar)} kWh / ${this._esc(this._config.usage_label)} ${this._fmt(totalUsage)} kWh">
-        <div class="ratio-bar">
-          <div class="ratio-fill solar" style="width:${solarPct.toFixed(1)}%"></div>
-          <div class="ratio-fill usage" style="width:${usagePct.toFixed(1)}%"></div>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-label">${this._esc(this._config.diff_label)}</div>
+          <div class="stat-value ${diff >= 0 ? "pos" : "neg"}">${diffText}</div>
         </div>
-        <div class="ratio-labels">
-          <span><i class="dot solar"></i>${this._esc(this._config.solar_label)} <b>${solarPct.toFixed(1)}%</b></span>
-          <span><i class="dot usage"></i>${this._esc(this._config.usage_label)} <b>${usagePct.toFixed(1)}%</b></span>
+        <div class="stat">
+          <div class="stat-label">${this._esc(this._config.self_label)}</div>
+          <div class="stat-value self">${selfPct.toFixed(1)}%</div>
         </div>
       </div>
     `;
@@ -656,17 +661,18 @@ class SolarEnergyCompareCard extends HTMLElement {
       .dot.solar { background:var(--solar-color); }
       .dot.usage { background:var(--usage-color); }
 
-      /* Ratio bar: left/right share of solar vs usage over the shown period */
-      .ratio { margin:0 0 8px; }
-      .ratio-bar { display:flex; height:12px; border-radius:8px; overflow:hidden;
-        background:rgba(127,127,127,.20); margin-bottom:6px; }
-      .ratio-fill { height:100%; transition:width .3s ease; }
-      .ratio-fill.solar { background:var(--solar-color); }
-      .ratio-fill.usage { background:var(--usage-color); }
-      .ratio-labels { display:flex; justify-content:space-between; align-items:center;
-        font-size:12px; color:var(--secondary-text-color, #727272); }
-      .ratio-labels b { color:var(--primary-text-color, #212121);
+      /* Stat boxes: today's net diff + self-sufficiency */
+      .stats { display:flex; gap:8px; margin:0 0 8px; }
+      .stat { flex:1; background:rgba(127,127,127,.10);
+        border:1px solid var(--divider-color, rgba(127,127,127,.25));
+        border-radius:11px; padding:7px 10px; text-align:center; }
+      .stat-label { font-size:11px; line-height:1.4;
+        color:var(--secondary-text-color, #727272); }
+      .stat-value { font-size:16px; font-weight:700; line-height:1.4;
         font-variant-numeric:tabular-nums; }
+      .stat-value.pos { color:var(--success-color, #43a047); }
+      .stat-value.neg { color:var(--error-color, #db4437); }
+      .stat-value.self { color:var(--primary-color, #1f7ae0); }
 
       /* Chart: bars+gridlines are SVG, axis labels are plain HTML so the
          browser renders them in the system font with no distortion. */
@@ -803,6 +809,10 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
           <ha-textfield id="list_label" label="List tab (รายการ)"></ha-textfield>
         </div>
         <div class="row2">
+          <ha-textfield id="diff_label" label="Diff label (ส่วนต่าง)"></ha-textfield>
+          <ha-textfield id="self_label" label="Self-sufficiency label"></ha-textfield>
+        </div>
+        <div class="row2">
           <ha-textfield id="days" label="Days (3-31)" type="number" min="3" max="31" inputmode="numeric"></ha-textfield>
           <ha-textfield id="decimals" label="Decimals (0-3)" type="number" min="0" max="3" inputmode="numeric"></ha-textfield>
         </div>
@@ -846,6 +856,8 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     setField("usage_label", c.usage_label || "");
     setField("chart_label", c.chart_label || "");
     setField("list_label", c.list_label || "");
+    setField("diff_label", c.diff_label || "");
+    setField("self_label", c.self_label || "");
     setField("days", c.days ?? 15);
     setField("decimals", c.decimals ?? 1);
 
@@ -870,6 +882,8 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     onField("usage_label", "usage_label", false);
     onField("chart_label", "chart_label", false);
     onField("list_label", "list_label", false);
+    onField("diff_label", "diff_label", false);
+    onField("self_label", "self_label", false);
     onField("days", "days", true);
     onField("decimals", "decimals", true);
 
