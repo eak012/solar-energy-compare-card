@@ -69,6 +69,8 @@ chart_label: กราฟ
 list_label: รายการ
 decimals: 1
 aggregation: delta
+solar_color: '#ff5c23'
+usage_color: '#c8f3ff'
 ```
 
 ## ⚙️ Configuration options
@@ -85,6 +87,8 @@ aggregation: delta
 | `list_label`   | string  | `รายการ`                            | ชื่อแท็บรายการ |
 | `decimals`     | number  | `1`                                  | จำนวนทศนิยม (0–3) |
 | `aggregation`  | string  | `delta`                              | `delta` = คำนวณรายวันจากมิเตอร์สะสม, `daily` = entity เป็นค่ารายวันอยู่แล้ว |
+|`solar_color`|HEX|— (บังคับ)|ใส่สีสำหรับ solar ผลิตไฟ|
+|`usage_color`|HEX|— (บังคับ)|ใส่สีสำหรับการใช้ไฟบ้าน|
 
 ### `aggregation: delta` vs `daily`
 
