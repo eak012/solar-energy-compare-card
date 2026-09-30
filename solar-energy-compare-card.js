@@ -1,4 +1,4 @@
-/* solar-energy-compare-card.js v2
+/* solar-energy-compare-card.js v4
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v2: adds กราฟ / รายการ tabs to match design mock.
@@ -19,9 +19,6 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config || !config.solar_entity || !config.usage_entity) {
-      throw new Error("solar-energy-compare-card requires solar_entity and usage_entity");
-    }
     this._config = {
       days: 15,
       title: "เปรียบเทียบการผลิตไฟ & การใช้ไฟบ้าน",
@@ -35,11 +32,26 @@ class SolarEnergyCompareCard extends HTMLElement {
       aggregation: "delta",
       ...config,
     };
+    // Don't throw for missing entities — show a friendly placeholder instead.
+    // This keeps getStubConfig("") working and the visual editor usable.
+    const wasMissing = this._configMissing;
+    const prevEntities = `${this._config?.solar_entity}|${this._config?.usage_entity}|${this._config?.days}|${this._config?.aggregation}`;
+    this._configMissing = !config?.solar_entity || !config?.usage_entity;
+    const newEntities = `${this._config.solar_entity}|${this._config.usage_entity}|${this._config.days}|${this._config.aggregation}`;
+    // Fetch history when entities become valid or change
+    if (!this._configMissing && this._hass) {
+      if (wasMissing || !this._loadedOnce || prevEntities !== newEntities) {
+        this._loadedOnce = true;
+        clearTimeout(this._timer);
+        this._timer = setTimeout(() => this._loadHistory(), 300);
+      }
+    }
     this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
+    if (this._configMissing) return;
     if (!this._loadedOnce) {
       this._loadedOnce = true;
       this._loadHistory();
@@ -78,7 +90,7 @@ class SolarEnergyCompareCard extends HTMLElement {
   }
 
   async _loadHistory() {
-    if (!this._hass || this._loading) return;
+    if (!this._hass || this._loading || this._configMissing) return;
     this._loading = true;
     this._error = null;
     this._render();
@@ -202,6 +214,11 @@ class SolarEnergyCompareCard extends HTMLElement {
   _render() {
     if (!this.shadowRoot) return;
     const style = `<style>${this._css()}</style>`;
+
+    if (this._configMissing) {
+      this.shadowRoot.innerHTML = `${style}<ha-card><div class="empty" style="padding:28px 16px;">กรุณาเลือก solar_entity และ usage_entity<br><small>เปิด Visual editor เพื่อเลือก entity</small></div></ha-card>`;
+      return;
+    }
 
     if (this._loading) {
       this.shadowRoot.innerHTML = `${style}<ha-card><div class="loading">กำลังโหลดข้อมูล...</div></ha-card>`;
