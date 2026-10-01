@@ -1,7 +1,15 @@
-/* solar-energy-compare-card.js v19
+/* solar-energy-compare-card.js v17
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
- * v19: Fixed iOS Companion App "Ghost Click" overriding mobile tooltip timeout.
+ * v12: Adds Net/Diff tooltip, custom colors, average line, self-sufficiency badge, and bar entrance animation.
+ * v13: solar_color/usage_color are YAML-only; removed from the visual editor.
+ * v14: restores solar_color/usage_color fields in the visual editor.
+ * v15: color fields use a native color picker + hex text field.
+ * v16: Compact tabs and auto-hide tooltip (timeout) for better mobile experience.
+ * v17: Fix desktop hover — tooltip is now pointer-events:none so it can never steal
+ *      the cursor (previously pointer-events:auto made it appear under the mouse,
+ *      firing pointerleave instantly and hiding itself). Mouse/pen: tooltip stays
+ *      while hovering, hides on pointerleave. Touch: keeps the 3s auto-hide.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -14,7 +22,7 @@ class SolarEnergyCompareCard extends HTMLElement {
     this._loading = false;
     this._error = null;
     this._selected = null;
-    this._view = "chart"; 
+    this._view = "chart"; // 'chart' | 'list'
     this._configTimer = null;
     this._refreshTimer = null;
     this._lastFetch = 0;
@@ -34,8 +42,8 @@ class SolarEnergyCompareCard extends HTMLElement {
       decimals: 1,
       history_hours: 24 * 17,
       aggregation: "delta",
-      solar_color: "#ffbd32", 
-      usage_color: "#2389ff", 
+      solar_color: "#ffbd32", // Default color
+      usage_color: "#2389ff", // Default color
       ...config,
     };
     this._configMissing = !config?.solar_entity || !config?.usage_entity;
@@ -543,31 +551,32 @@ class SolarEnergyCompareCard extends HTMLElement {
     if (!plot || !tooltip) return;
 
     let hideTimeout = null;
-    let lastTouchTime = 0; // ตัวจับเวลาเพื่อกรอง Ghost Click บน iOS
 
+    // ซ่อน Tooltip (ใช้ทั้ง mouse และ touch)
     const hideTooltip = () => {
+      if (hideTimeout) { clearTimeout(hideTimeout); hideTimeout = null; }
       tooltip.classList.remove("show");
       this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
     };
 
-    const show = (date, event) => {
+    // auto-hide 3 วินาที เฉพาะ touch (มือถือ) — mouse ไม่ตั้งเวลา ซ่อนตอน pointerleave แทน
+    const armAutoHide = (isTouch) => {
+      if (hideTimeout) { clearTimeout(hideTimeout); hideTimeout = null; }
+      if (isTouch) hideTimeout = setTimeout(hideTooltip, 3000);
+    };
+
+    const show = (date, event, isTouch = false) => {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
-
-      // ถ้า Event มาจากการแตะ (Touch) ให้บันทึกเวลาล่าสุดไว้
-      if (event && (event.type === "touchstart" || event.pointerType === "touch")) {
-        lastTouchTime = Date.now();
-      }
-
       this._selected = date;
+
+      // ลบสถานะ active เดิมออกก่อน แล้วใส่ให้แค่วันที่เลือก
       this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
       this.shadowRoot.querySelectorAll(`.day-group[data-date="${date}"]`).forEach(g => g.classList.add("active"));
 
       const rect = plot.getBoundingClientRect();
-      const clientX = event?.touches?.[0]?.clientX ?? event?.clientX ?? (rect.left + rect.width / 2);
-      const clientY = event?.touches?.[0]?.clientY ?? event?.clientY ?? (rect.top + 20);
-      const x = clientX - rect.left;
-      const y = clientY - rect.top;
+      const x = (event?.clientX ?? rect.left + rect.width / 2) - rect.left;
+      const y = (event?.clientY ?? rect.top + 20) - rect.top;
 
       const diff = d.solar - d.usage;
       const diffColor = diff >= 0 ? "var(--solar-color)" : "var(--error-color, #db4437)";
@@ -584,65 +593,36 @@ class SolarEnergyCompareCard extends HTMLElement {
       `;
       tooltip.classList.add("show");
 
-      const tw = 185; 
+      const tw = 185;
       let left = x - tw / 2;
       left = Math.max(4, Math.min(rect.width - tw - 4, left));
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${Math.max(4, y - 90)}px`;
 
-      if (hideTimeout) clearTimeout(hideTimeout);
-      
-      // ถ้าระบบตรวจพบว่ามีการ "แตะจอ" ในช่วง 2 วินาทีที่ผ่านมา (ครอบคลุม Ghost Events ของ iOS ทั้งหมด)
-      // ให้ทำการนับถอยหลัง 3 วินาทีเสมอ เพื่อป้องกันการค้าง
-      if (Date.now() - lastTouchTime < 2000) {
-        hideTimeout = setTimeout(hideTooltip, 3000);
-      }
+      // touch: ซ่อนอัตโนมัติใน 3 วินาที (รีเซ็ตทุกครั้งที่ขยับนิ้ว)
+      // mouse: ค้างไว้จนกว่าเมาส์จะออกจากแท่ง (pointerleave)
+      armAutoHide(isTouch);
     };
 
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
-      // 1. รับคำสั่งแตะจอ (มือถือ)
-      group.addEventListener("touchstart", e => {
-        lastTouchTime = Date.now();
-        show(group.dataset.date, e);
-      }, { passive: true });
-
-      // 2. รับคำสั่งเมาส์ชี้เข้า (คอมพิวเตอร์ หรือ iOS แอบส่ง)
-      group.addEventListener("pointerenter", e => {
-        show(group.dataset.date, e);
-      });
-
-      // 3. รับคำสั่งเมาส์/นิ้ว ขยับไปมาบนกราฟ
+      const isTouchPointer = (e) => e.pointerType === "touch";
+      group.addEventListener("pointerenter", e => show(group.dataset.date, e, isTouchPointer(e)));
       group.addEventListener("pointermove", e => {
-        if (e.pointerType === "touch") lastTouchTime = Date.now();
-
         const tt = this.shadowRoot.querySelector("#tooltip");
         if (!tt?.classList.contains("show")) return;
-
         const rect = plot.getBoundingClientRect();
-        const clientX = e.touches?.[0]?.clientX ?? e.clientX;
-        const x = clientX - rect.left;
+        const x = e.clientX - rect.left;
         const tw = 185;
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
-        
-        if (hideTimeout) clearTimeout(hideTimeout);
-        if (Date.now() - lastTouchTime < 2000) {
-          hideTimeout = setTimeout(hideTooltip, 3000);
-        }
-      });
 
-      // 4. รับคำสั่งเอาเมาส์ออก
-      group.addEventListener("pointerleave", e => {
-        // จะซ่อนทันที ก็ต่อเมื่อแน่ใจว่า "ไม่ใช่การแตะมือถือ" (คือเวลาต้องผ่านไปเกิน 2 วิแล้ว)
-        if (Date.now() - lastTouchTime >= 2000) {
-          if (hideTimeout) clearTimeout(hideTimeout);
-          hideTooltip();
-        }
+        // ขยับนิ้วบนมือถือ = รีเซ็ตเวลา 3 วินาทีใหม่
+        armAutoHide(isTouchPointer(e));
       });
-
-      // 5. รับคำสั่งคลิก (คอมพิวเตอร์ หรือ iOS แอบส่ง)
-      group.addEventListener("click", e => {
-        show(group.dataset.date, e);
-      });
+      group.addEventListener("pointerleave", hideTooltip);
+      group.addEventListener("click", e => show(group.dataset.date, e, isTouchPointer(e)));
+      group.addEventListener("touchstart", e => {
+        show(group.dataset.date, e.touches[0], true);
+      }, { passive: true });
     });
   }
 
@@ -663,6 +643,7 @@ class SolarEnergyCompareCard extends HTMLElement {
       ha-card { overflow:hidden; border-radius:16px; color:var(--primary-text-color, #212121); }
       .wrap { padding:12px 12px 10px; position:relative; }
 
+      /* ปรับลดขนาดแท็บให้กะทัดรัด (Compact Tabs) */
       .tabs { display:inline-flex; min-width:140px; background:rgba(127,127,127,.12); border-radius:8px; padding:2px; margin-bottom:10px; gap:2px; }
       .tab { flex:1; border:0; border-radius:6px; padding:4px 10px; font-size:12px; font-weight:600; background:transparent; color:var(--secondary-text-color, #727272); cursor:pointer; transition:background .15s ease, color .15s ease; }
       .tab.active { background:var(--primary-color, #1f7ae0); color:var(--text-primary-color, #fff); box-shadow:0 2px 6px rgba(0,0,0,.20); }
@@ -705,8 +686,11 @@ class SolarEnergyCompareCard extends HTMLElement {
       .x-col b { display:block; font-size:11px; font-weight:500; line-height:1.3; font-variant-numeric:tabular-nums; }
       .x-col span { display:block; font-size:10px; line-height:1.3; color:var(--secondary-text-color, #727272); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
+      /* v17: tooltip ต้องไม่รับ pointer event เด็ดขาด (pointer-events:none ตลอด)
+         ไม่งั้น tooltip ที่โผล่มาทับตำแหน่งเมาส์จะ "ขโมย" pointer ไป ทำให้เกิด
+         pointerleave บนแท่งกราฟทันที → tooltip ถูกซ่อนทันที วนลูปจนดูเหมือนไม่แสดง */
       .tooltip { position:absolute; z-index:10; width:185px; box-sizing:border-box; padding:9px 11px; border-radius:11px; background:var(--card-background-color, #fff); border:1px solid var(--divider-color, rgba(127,127,127,.4)); box-shadow:0 8px 24px rgba(0,0,0,.25); color:var(--primary-text-color, #212121); font-size:12px; line-height:1.8; pointer-events:none; opacity:0; transform:translateY(4px); transition:opacity .2s ease, transform .2s ease; }
-      .tooltip.show { opacity:1; transform:translateY(0); pointer-events:none; }
+      .tooltip.show { opacity:1; transform:translateY(0); }
       .tooltip .dot { width:8px; height:8px; margin-right:5px; }
       .tip-date { font-weight:700; margin-bottom:2px; }
       .tip-diff { margin-top:4px; padding-top:4px; border-top:1px solid var(--divider-color, rgba(127,127,127,.2)); }
@@ -934,6 +918,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Solar vs home usage chart with iOS Safari Ghost-Click proof auto-hide tooltip.",
+  description: "Solar vs home usage chart with hover tooltip and mobile auto-hide.",
   preview: true,
 });
