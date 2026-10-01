@@ -1,4 +1,4 @@
-/* solar-energy-compare-card.js v17
+/* solar-energy-compare-card.js v18
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v12: Adds Net/Diff tooltip, custom colors, average line, self-sufficiency badge, and bar entrance animation.
@@ -10,6 +10,10 @@
  *      the cursor (previously pointer-events:auto made it appear under the mouse,
  *      firing pointerleave instantly and hiding itself). Mouse/pen: tooltip stays
  *      while hovering, hides on pointerleave. Touch: keeps the 3s auto-hide.
+ * v18: Fix mobile auto-hide — the emulated click fired after a tap is a MouseEvent
+ *      with no pointerType, so v17 wrongly treated it as mouse and never armed the
+ *      3s timer (tooltip got stuck on screen). Touch is now also detected via the
+ *      most recent touchstart timestamp.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -604,9 +608,13 @@ class SolarEnergyCompareCard extends HTMLElement {
       armAutoHide(isTouch);
     };
 
+    // v18: จับ touch ให้แม่น — emulated click หลังแตะจอเป็น MouseEvent ที่ไม่มี
+    // pointerType เลยต้องจำเวลา touchstart ล่าสุดไว้ด้วย
+    let lastTouchTs = 0;
+    const isTouchInput = (e) => e?.pointerType === "touch" || (Date.now() - lastTouchTs < 800);
+
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
-      const isTouchPointer = (e) => e.pointerType === "touch";
-      group.addEventListener("pointerenter", e => show(group.dataset.date, e, isTouchPointer(e)));
+      group.addEventListener("pointerenter", e => show(group.dataset.date, e, isTouchInput(e)));
       group.addEventListener("pointermove", e => {
         const tt = this.shadowRoot.querySelector("#tooltip");
         if (!tt?.classList.contains("show")) return;
@@ -616,11 +624,12 @@ class SolarEnergyCompareCard extends HTMLElement {
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
 
         // ขยับนิ้วบนมือถือ = รีเซ็ตเวลา 3 วินาทีใหม่
-        armAutoHide(isTouchPointer(e));
+        armAutoHide(isTouchInput(e));
       });
       group.addEventListener("pointerleave", hideTooltip);
-      group.addEventListener("click", e => show(group.dataset.date, e, isTouchPointer(e)));
+      group.addEventListener("click", e => show(group.dataset.date, e, isTouchInput(e)));
       group.addEventListener("touchstart", e => {
+        lastTouchTs = Date.now();
         show(group.dataset.date, e.touches[0], true);
       }, { passive: true });
     });
