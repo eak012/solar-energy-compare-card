@@ -1,7 +1,7 @@
-/* solar-energy-compare-card.js v18
+/* solar-energy-compare-card.js v19
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
- * v18: Fixed mobile touch popup staying forever (Event bubbling / pointerType fallback fixed).
+ * v19: Fixed iOS Companion App "Ghost Click" overriding mobile tooltip timeout.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -543,7 +543,7 @@ class SolarEnergyCompareCard extends HTMLElement {
     if (!plot || !tooltip) return;
 
     let hideTimeout = null;
-    let isTouchContext = false; // จำสถานะไว้เพื่อกัน Event ชนกัน
+    let lastTouchTime = 0; // ตัวจับเวลาเพื่อกรอง Ghost Click บน iOS
 
     const hideTooltip = () => {
       tooltip.classList.remove("show");
@@ -554,13 +554,9 @@ class SolarEnergyCompareCard extends HTMLElement {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
 
-      // ถ้าเป็น Touch ให้เปลี่ยนสถานะเป็นโหมด Touch ทันที
-      if (event) {
-        if (event.pointerType === "touch" || event.type === "touchstart") {
-          isTouchContext = true;
-        } else if (event.pointerType === "mouse") {
-          isTouchContext = false;
-        }
+      // ถ้า Event มาจากการแตะ (Touch) ให้บันทึกเวลาล่าสุดไว้
+      if (event && (event.type === "touchstart" || event.pointerType === "touch")) {
+        lastTouchTime = Date.now();
       }
 
       this._selected = date;
@@ -594,24 +590,33 @@ class SolarEnergyCompareCard extends HTMLElement {
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${Math.max(4, y - 90)}px`;
 
-      // ลบเวลาเก่าทิ้งเสมอที่มีการแตะหรือขยับ
       if (hideTimeout) clearTimeout(hideTimeout);
       
-      // ถ้าระบบจำได้ว่ากำลังใช้นิ้วแตะ (มือถือ) จะสั่งซ่อนเองใน 3 วินาที
-      if (isTouchContext) {
+      // ถ้าระบบตรวจพบว่ามีการ "แตะจอ" ในช่วง 2 วินาทีที่ผ่านมา (ครอบคลุม Ghost Events ของ iOS ทั้งหมด)
+      // ให้ทำการนับถอยหลัง 3 วินาทีเสมอ เพื่อป้องกันการค้าง
+      if (Date.now() - lastTouchTime < 2000) {
         hideTimeout = setTimeout(hideTooltip, 3000);
       }
     };
 
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
-      group.addEventListener("pointerenter", e => show(group.dataset.date, e));
-      
+      // 1. รับคำสั่งแตะจอ (มือถือ)
+      group.addEventListener("touchstart", e => {
+        lastTouchTime = Date.now();
+        show(group.dataset.date, e);
+      }, { passive: true });
+
+      // 2. รับคำสั่งเมาส์ชี้เข้า (คอมพิวเตอร์ หรือ iOS แอบส่ง)
+      group.addEventListener("pointerenter", e => {
+        show(group.dataset.date, e);
+      });
+
+      // 3. รับคำสั่งเมาส์/นิ้ว ขยับไปมาบนกราฟ
       group.addEventListener("pointermove", e => {
+        if (e.pointerType === "touch") lastTouchTime = Date.now();
+
         const tt = this.shadowRoot.querySelector("#tooltip");
         if (!tt?.classList.contains("show")) return;
-
-        if (e.pointerType === "touch") isTouchContext = true;
-        else if (e.pointerType === "mouse") isTouchContext = false;
 
         const rect = plot.getBoundingClientRect();
         const clientX = e.touches?.[0]?.clientX ?? e.clientX;
@@ -620,22 +625,24 @@ class SolarEnergyCompareCard extends HTMLElement {
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
         
         if (hideTimeout) clearTimeout(hideTimeout);
-        if (isTouchContext) {
+        if (Date.now() - lastTouchTime < 2000) {
           hideTimeout = setTimeout(hideTooltip, 3000);
         }
       });
-      
+
+      // 4. รับคำสั่งเอาเมาส์ออก
       group.addEventListener("pointerleave", e => {
-        // คอมพิวเตอร์ เอาเมาส์ออก ซ่อนทันที
-        if (e.pointerType === "mouse") {
+        // จะซ่อนทันที ก็ต่อเมื่อแน่ใจว่า "ไม่ใช่การแตะมือถือ" (คือเวลาต้องผ่านไปเกิน 2 วิแล้ว)
+        if (Date.now() - lastTouchTime >= 2000) {
           if (hideTimeout) clearTimeout(hideTimeout);
           hideTooltip();
-          isTouchContext = false;
         }
       });
-      
-      group.addEventListener("click", e => show(group.dataset.date, e));
-      group.addEventListener("touchstart", e => show(group.dataset.date, e), { passive: true });
+
+      // 5. รับคำสั่งคลิก (คอมพิวเตอร์ หรือ iOS แอบส่ง)
+      group.addEventListener("click", e => {
+        show(group.dataset.date, e);
+      });
     });
   }
 
@@ -927,6 +934,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Solar vs home usage chart with touch-friendly auto-hide tooltip.",
+  description: "Solar vs home usage chart with iOS Safari Ghost-Click proof auto-hide tooltip.",
   preview: true,
 });
