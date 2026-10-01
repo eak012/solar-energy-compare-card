@@ -1,12 +1,7 @@
-/* solar-energy-compare-card.js v17
+/* solar-energy-compare-card.js v18
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
- * v12: Adds Net/Diff tooltip, custom colors, average line, self-sufficiency badge, and bar entrance animation.
- * v13: solar_color/usage_color are YAML-only; removed from the visual editor.
- * v14: restores solar_color/usage_color fields in the visual editor.
- * v15: color fields use a native color picker + hex text field.
- * v16: Compact tabs and auto-hide tooltip (timeout) for better mobile experience.
- * v17: Fixed PC mouse hover issue (pointer-events bug) and separated Touch vs Mouse timer logic.
+ * v18: Fixed mobile touch popup staying forever (Event bubbling / pointerType fallback fixed).
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -548,23 +543,35 @@ class SolarEnergyCompareCard extends HTMLElement {
     if (!plot || !tooltip) return;
 
     let hideTimeout = null;
+    let isTouchContext = false; // จำสถานะไว้เพื่อกัน Event ชนกัน
 
     const hideTooltip = () => {
       tooltip.classList.remove("show");
       this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
     };
 
-    const show = (date, event, isTouchOverride = false) => {
+    const show = (date, event) => {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
+
+      // ถ้าเป็น Touch ให้เปลี่ยนสถานะเป็นโหมด Touch ทันที
+      if (event) {
+        if (event.pointerType === "touch" || event.type === "touchstart") {
+          isTouchContext = true;
+        } else if (event.pointerType === "mouse") {
+          isTouchContext = false;
+        }
+      }
+
       this._selected = date;
-      
       this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
       this.shadowRoot.querySelectorAll(`.day-group[data-date="${date}"]`).forEach(g => g.classList.add("active"));
 
       const rect = plot.getBoundingClientRect();
-      const x = (event?.clientX ?? rect.left + rect.width / 2) - rect.left;
-      const y = (event?.clientY ?? rect.top + 20) - rect.top;
+      const clientX = event?.touches?.[0]?.clientX ?? event?.clientX ?? (rect.left + rect.width / 2);
+      const clientY = event?.touches?.[0]?.clientY ?? event?.clientY ?? (rect.top + 20);
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
 
       const diff = d.solar - d.usage;
       const diffColor = diff >= 0 ? "var(--solar-color)" : "var(--error-color, #db4437)";
@@ -587,42 +594,48 @@ class SolarEnergyCompareCard extends HTMLElement {
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${Math.max(4, y - 90)}px`;
 
-      // เช็คว่าเป็นอุปกรณ์ Touch หรือไม่
-      const isTouch = isTouchOverride || (event && event.pointerType === "touch");
+      // ลบเวลาเก่าทิ้งเสมอที่มีการแตะหรือขยับ
       if (hideTimeout) clearTimeout(hideTimeout);
       
-      if (isTouch) {
+      // ถ้าระบบจำได้ว่ากำลังใช้นิ้วแตะ (มือถือ) จะสั่งซ่อนเองใน 3 วินาที
+      if (isTouchContext) {
         hideTimeout = setTimeout(hideTooltip, 3000);
       }
     };
 
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
       group.addEventListener("pointerenter", e => show(group.dataset.date, e));
+      
       group.addEventListener("pointermove", e => {
         const tt = this.shadowRoot.querySelector("#tooltip");
         if (!tt?.classList.contains("show")) return;
+
+        if (e.pointerType === "touch") isTouchContext = true;
+        else if (e.pointerType === "mouse") isTouchContext = false;
+
         const rect = plot.getBoundingClientRect();
-        const x = e.clientX - rect.left;
+        const clientX = e.touches?.[0]?.clientX ?? e.clientX;
+        const x = clientX - rect.left;
         const tw = 185;
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
         
-        if (e.pointerType === "touch") {
-          if (hideTimeout) clearTimeout(hideTimeout);
+        if (hideTimeout) clearTimeout(hideTimeout);
+        if (isTouchContext) {
           hideTimeout = setTimeout(hideTooltip, 3000);
-        } else {
-          // ถ้าเป็นเมาส์ ไม่ต้องตั้งเวลาซ่อน ปล่อยค้างไว้
-          if (hideTimeout) clearTimeout(hideTimeout);
         }
       });
-      group.addEventListener("pointerleave", () => {
-        // ซ่อนทันทีเมื่อเมาส์เลื่อนออก
-        if (hideTimeout) clearTimeout(hideTimeout);
-        hideTooltip();
+      
+      group.addEventListener("pointerleave", e => {
+        // คอมพิวเตอร์ เอาเมาส์ออก ซ่อนทันที
+        if (e.pointerType === "mouse") {
+          if (hideTimeout) clearTimeout(hideTimeout);
+          hideTooltip();
+          isTouchContext = false;
+        }
       });
+      
       group.addEventListener("click", e => show(group.dataset.date, e));
-      group.addEventListener("touchstart", e => {
-        show(group.dataset.date, e.touches[0], true);
-      }, { passive: true });
+      group.addEventListener("touchstart", e => show(group.dataset.date, e), { passive: true });
     });
   }
 
@@ -685,7 +698,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       .x-col b { display:block; font-size:11px; font-weight:500; line-height:1.3; font-variant-numeric:tabular-nums; }
       .x-col span { display:block; font-size:10px; line-height:1.3; color:var(--secondary-text-color, #727272); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-      /* แก้ไข pointer-events:none ป้องกันการบังเมาส์ */
       .tooltip { position:absolute; z-index:10; width:185px; box-sizing:border-box; padding:9px 11px; border-radius:11px; background:var(--card-background-color, #fff); border:1px solid var(--divider-color, rgba(127,127,127,.4)); box-shadow:0 8px 24px rgba(0,0,0,.25); color:var(--primary-text-color, #212121); font-size:12px; line-height:1.8; pointer-events:none; opacity:0; transform:translateY(4px); transition:opacity .2s ease, transform .2s ease; }
       .tooltip.show { opacity:1; transform:translateY(0); pointer-events:none; }
       .tooltip .dot { width:8px; height:8px; margin-right:5px; }
@@ -915,6 +927,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Solar vs home usage chart with compact tabs, reliable PC hover, and auto-hide mobile tooltip.",
+  description: "Solar vs home usage chart with touch-friendly auto-hide tooltip.",
   preview: true,
 });
