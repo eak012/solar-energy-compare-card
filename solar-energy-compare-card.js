@@ -1,10 +1,11 @@
-/* solar-energy-compare-card.js v15
+/* solar-energy-compare-card.js v16
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v12: Adds Net/Diff tooltip, custom colors, average line, self-sufficiency badge, and bar entrance animation.
  * v13: solar_color/usage_color are YAML-only; removed from the visual editor.
  * v14: restores solar_color/usage_color fields in the visual editor.
  * v15: color fields use a native color picker + hex text field.
+ * v16: Compact tabs and auto-hide tooltip (timeout) for better mobile experience.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -452,7 +453,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       const sPct = Math.max(2, (d.solar / max) * 100);
       const uPct = Math.max(2, (d.usage / max) * 100);
 
-      // Calculate self-sufficiency percentage
       const suff = d.usage > 0 ? Math.min(100, (d.solar / d.usage) * 100) : (d.solar > 0 ? 100 : 0);
 
       return `
@@ -486,7 +486,6 @@ class SolarEnergyCompareCard extends HTMLElement {
     const gap = Math.min(5, groupW * 0.10);
     const barW = Math.max(3, (groupW - gap * 3) / 2);
 
-    // Calculate Average Solar Line
     const avgSolar = data.reduce((sum, d) => sum + d.solar, 0) / data.length;
     const avgY = H - H * (avgSolar / max);
 
@@ -499,7 +498,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       svg += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" class="grid"/>`;
     }
 
-    // Draw Average Line
     if (data.length > 0) {
       svg += `<line x1="0" y1="${avgY}" x2="${W}" y2="${avgY}" class="avg-line" stroke-dasharray="4 4"/>`;
     }
@@ -514,7 +512,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       const usageY = H - usageH;
       const active = d.date === this._selected ? " active" : "";
 
-      // Bar entrance animation delays
       const delay1 = (i * 0.02).toFixed(2);
       const delay2 = (i * 0.02 + 0.1).toFixed(2);
 
@@ -549,18 +546,27 @@ class SolarEnergyCompareCard extends HTMLElement {
     const tooltip = this.shadowRoot.querySelector("#tooltip");
     if (!plot || !tooltip) return;
 
+    let hideTimeout = null;
+
+    // ฟังก์ชันซ่อน Tooltip อัตโนมัติ
+    const hideTooltip = () => {
+      tooltip.classList.remove("show");
+      this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
+    };
+
     const show = (date, event) => {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
       this._selected = date;
-      this.shadowRoot.querySelectorAll(".day-group").forEach(g =>
-        g.classList.toggle("active", g.dataset.date === date));
+      
+      // ลบสถานะ active เดิมออกก่อน แล้วใส่ให้แค่วันที่เลือก
+      this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
+      this.shadowRoot.querySelectorAll(`.day-group[data-date="${date}"]`).forEach(g => g.classList.add("active"));
 
       const rect = plot.getBoundingClientRect();
       const x = (event?.clientX ?? rect.left + rect.width / 2) - rect.left;
       const y = (event?.clientY ?? rect.top + 20) - rect.top;
 
-      // Calculate diff for tooltip
       const diff = d.solar - d.usage;
       const diffColor = diff >= 0 ? "var(--solar-color)" : "var(--error-color, #db4437)";
       const diffSign = diff >= 0 ? "+" : "";
@@ -576,11 +582,15 @@ class SolarEnergyCompareCard extends HTMLElement {
       `;
       tooltip.classList.add("show");
 
-      const tw = 185; // slightly wider for diff text
+      const tw = 185; 
       let left = x - tw / 2;
       left = Math.max(4, Math.min(rect.width - tw - 4, left));
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${Math.max(4, y - 90)}px`;
+
+      // รีเซ็ต Timer ทุกครั้งที่มีการขยับนิ้ว/เมาส์ (ซ่อนอัตโนมัติภายใน 3 วินาที)
+      if (hideTimeout) clearTimeout(hideTimeout);
+      hideTimeout = setTimeout(hideTooltip, 3000);
     };
 
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
@@ -592,9 +602,15 @@ class SolarEnergyCompareCard extends HTMLElement {
         const x = e.clientX - rect.left;
         const tw = 185;
         tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
+        
+        // ขยับเมาส์/นิ้ว = รีเซ็ตเวลาใหม่
+        if (hideTimeout) clearTimeout(hideTimeout);
+        hideTimeout = setTimeout(hideTooltip, 3000);
       });
       group.addEventListener("pointerleave", () => {
-        tooltip.classList.remove("show");
+        // เมื่อเอาเมาส์ออก ให้ลบ Timer และซ่อนทันที
+        if (hideTimeout) clearTimeout(hideTimeout);
+        hideTooltip();
       });
       group.addEventListener("click", e => show(group.dataset.date, e));
       group.addEventListener("touchstart", e => {
@@ -620,9 +636,10 @@ class SolarEnergyCompareCard extends HTMLElement {
       ha-card { overflow:hidden; border-radius:16px; color:var(--primary-text-color, #212121); }
       .wrap { padding:12px 12px 10px; position:relative; }
 
-      .tabs { display:flex; background:rgba(127,127,127,.18); border-radius:12px; padding:4px; margin-bottom:10px; gap:4px; }
-      .tab { flex:1; border:0; border-radius:9px; padding:7px 0; font-size:13px; font-weight:600; background:transparent; color:var(--secondary-text-color, #727272); cursor:pointer; transition:background .15s ease, color .15s ease; }
-      .tab.active { background:var(--primary-color, #1f7ae0); color:var(--text-primary-color, #fff); box-shadow:0 2px 8px rgba(0,0,0,.25); }
+      /* ปรับลดขนาดแท็บให้กะทัดรัด (Compact Tabs) */
+      .tabs { display:inline-flex; min-width:140px; background:rgba(127,127,127,.12); border-radius:8px; padding:2px; margin-bottom:10px; gap:2px; }
+      .tab { flex:1; border:0; border-radius:6px; padding:4px 10px; font-size:12px; font-weight:600; background:transparent; color:var(--secondary-text-color, #727272); cursor:pointer; transition:background .15s ease, color .15s ease; }
+      .tab.active { background:var(--primary-color, #1f7ae0); color:var(--text-primary-color, #fff); box-shadow:0 2px 6px rgba(0,0,0,.20); }
 
       .title { font-size:15px; line-height:1.25; font-weight:700; margin:0 0 8px; }
       .legend { display:flex; gap:18px; align-items:center; flex-wrap:wrap; font-size:12px; margin-bottom:10px; color:var(--secondary-text-color, #727272); }
@@ -647,7 +664,6 @@ class SolarEnergyCompareCard extends HTMLElement {
       .day-group.active .hit { fill:rgba(42,137,255,.10); stroke:rgba(42,137,255,.50); stroke-width:1; }
       .day-group.active .solar-bar, .day-group.active .usage-bar { filter:brightness(1.08); }
 
-      /* Bar Animation */
       @keyframes barGrow {
         from { transform: scaleY(0); opacity: 0; }
         to { transform: scaleY(1); opacity: 1; }
@@ -663,8 +679,8 @@ class SolarEnergyCompareCard extends HTMLElement {
       .x-col b { display:block; font-size:11px; font-weight:500; line-height:1.3; font-variant-numeric:tabular-nums; }
       .x-col span { display:block; font-size:10px; line-height:1.3; color:var(--secondary-text-color, #727272); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-      .tooltip { position:absolute; z-index:10; width:185px; box-sizing:border-box; padding:9px 11px; border-radius:11px; background:var(--card-background-color, #fff); border:1px solid var(--divider-color, rgba(127,127,127,.4)); box-shadow:0 8px 24px rgba(0,0,0,.25); color:var(--primary-text-color, #212121); font-size:12px; line-height:1.8; pointer-events:none; opacity:0; transform:translateY(4px); transition:opacity .12s ease, transform .12s ease; }
-      .tooltip.show { opacity:1; transform:translateY(0); }
+      .tooltip { position:absolute; z-index:10; width:185px; box-sizing:border-box; padding:9px 11px; border-radius:11px; background:var(--card-background-color, #fff); border:1px solid var(--divider-color, rgba(127,127,127,.4)); box-shadow:0 8px 24px rgba(0,0,0,.25); color:var(--primary-text-color, #212121); font-size:12px; line-height:1.8; pointer-events:none; opacity:0; transform:translateY(4px); transition:opacity .2s ease, transform .2s ease; }
+      .tooltip.show { opacity:1; transform:translateY(0); pointer-events:auto; }
       .tooltip .dot { width:8px; height:8px; margin-right:5px; }
       .tip-date { font-weight:700; margin-bottom:2px; }
       .tip-diff { margin-top:4px; padding-top:4px; border-top:1px solid var(--divider-color, rgba(127,127,127,.2)); }
@@ -847,8 +863,6 @@ class SolarEnergyCompareCardEditor extends HTMLElement {
     onField("days", "days", true);
     onField("decimals", "decimals", true);
 
-    // Color pickers: native color input synced both ways with the hex text field.
-    // The picker only understands #rrggbb; anything else stays text-only.
     const isHexColor = (v) => /^#[0-9a-fA-F]{6}$/.test(String(v || "").trim());
     const wireColor = (textId, pickerId, key, fallback) => {
       const text = $(textId);
@@ -894,6 +908,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Solar vs home usage chart with กราฟ/รายการ tabs, hover/touch tooltip.",
+  description: "Solar vs home usage chart with compact tabs and auto-hide tooltip.",
   preview: true,
 });
