@@ -1,4 +1,4 @@
-/* solar-energy-compare-card.js v18
+/* solar-energy-compare-card.js v19
  * Home Assistant Lovelace Custom Card
  * Compares daily solar production and household energy use.
  * v12: Adds Net/Diff tooltip, custom colors, average line, self-sufficiency badge, and bar entrance animation.
@@ -14,6 +14,9 @@
  *      with no pointerType, so v17 wrongly treated it as mouse and never armed the
  *      3s timer (tooltip got stuck on screen). Touch is now also detected via the
  *      most recent touchstart timestamp.
+ * v19: Click-only tooltip — hover removed entirely (no pointerenter/pointermove/
+ *      pointerleave); tooltip shows on click/tap only and auto-hides after 3s on
+ *      all devices. Same simple behavior everywhere.
  */
 
 class SolarEnergyCompareCard extends HTMLElement {
@@ -556,20 +559,15 @@ class SolarEnergyCompareCard extends HTMLElement {
 
     let hideTimeout = null;
 
-    // ซ่อน Tooltip (ใช้ทั้ง mouse และ touch)
+    // ซ่อน Tooltip
     const hideTooltip = () => {
       if (hideTimeout) { clearTimeout(hideTimeout); hideTimeout = null; }
       tooltip.classList.remove("show");
       this.shadowRoot.querySelectorAll(".day-group").forEach(g => g.classList.remove("active"));
     };
 
-    // auto-hide 3 วินาที เฉพาะ touch (มือถือ) — mouse ไม่ตั้งเวลา ซ่อนตอน pointerleave แทน
-    const armAutoHide = (isTouch) => {
-      if (hideTimeout) { clearTimeout(hideTimeout); hideTimeout = null; }
-      if (isTouch) hideTimeout = setTimeout(hideTooltip, 3000);
-    };
-
-    const show = (date, event, isTouch = false) => {
+    // v19: แสดงเฉพาะตอนคลิก/แตะเท่านั้น แล้วหายเองใน 3 วินาที (ทุกอุปกรณ์เหมือนกัน)
+    const show = (date, event) => {
       const d = this._data.find(x => x.date === date);
       if (!d) return;
       this._selected = date;
@@ -603,35 +601,14 @@ class SolarEnergyCompareCard extends HTMLElement {
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${Math.max(4, y - 90)}px`;
 
-      // touch: ซ่อนอัตโนมัติใน 3 วินาที (รีเซ็ตทุกครั้งที่ขยับนิ้ว)
-      // mouse: ค้างไว้จนกว่าเมาส์จะออกจากแท่ง (pointerleave)
-      armAutoHide(isTouch);
+      // หายเองใน 3 วินาที — คลิกแท่งอื่นก่อนครบเวลาจะรีเซ็ตเวลาใหม่
+      if (hideTimeout) clearTimeout(hideTimeout);
+      hideTimeout = setTimeout(hideTooltip, 3000);
     };
 
-    // v18: จับ touch ให้แม่น — emulated click หลังแตะจอเป็น MouseEvent ที่ไม่มี
-    // pointerType เลยต้องจำเวลา touchstart ล่าสุดไว้ด้วย
-    let lastTouchTs = 0;
-    const isTouchInput = (e) => e?.pointerType === "touch" || (Date.now() - lastTouchTs < 800);
-
+    // คลิกเท่านั้น ไม่มี hover — บนมือถือ tap จะได้ emulated click ตามมาเอง
     this.shadowRoot.querySelectorAll(".day-group").forEach(group => {
-      group.addEventListener("pointerenter", e => show(group.dataset.date, e, isTouchInput(e)));
-      group.addEventListener("pointermove", e => {
-        const tt = this.shadowRoot.querySelector("#tooltip");
-        if (!tt?.classList.contains("show")) return;
-        const rect = plot.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const tw = 185;
-        tt.style.left = `${Math.max(4, Math.min(rect.width - tw - 4, x - tw / 2))}px`;
-
-        // ขยับนิ้วบนมือถือ = รีเซ็ตเวลา 3 วินาทีใหม่
-        armAutoHide(isTouchInput(e));
-      });
-      group.addEventListener("pointerleave", hideTooltip);
-      group.addEventListener("click", e => show(group.dataset.date, e, isTouchInput(e)));
-      group.addEventListener("touchstart", e => {
-        lastTouchTs = Date.now();
-        show(group.dataset.date, e.touches[0], true);
-      }, { passive: true });
+      group.addEventListener("click", e => show(group.dataset.date, e));
     });
   }
 
@@ -927,6 +904,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "solar-energy-compare-card",
   name: "Solar Energy Compare Card",
-  description: "Solar vs home usage chart with hover tooltip and mobile auto-hide.",
+  description: "Solar vs home usage chart — click a bar for details, auto-hides in 3s.",
   preview: true,
 });
